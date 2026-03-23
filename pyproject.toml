@@ -8,6 +8,7 @@ dependencies = [
     "mcp[cli]>=1.2.0",
     "pykx>=4.0.0.b4",
     "pydantic-settings",
+    "packaging",
     # Optional: Manage below packages for embedding support
     # "sentence_transformers",
     # "openai",
@@ -18,6 +19,7 @@ dependencies = [
 dev = [
     "ruff>=0.1.0",
     "pytest>=7.3.2,<8",
+    "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.0.0,<5",
     "pytest-mock",
     "coverage>=7.8.0",
@@ -31,6 +33,12 @@ mcp-server = "mcp_server:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "live_kdb: requires a running KDB-X service on port 5001 (deselect with '-m not live_kdb')",
+]
 
 [tool.coverage.run]
 command_line = "-m pytest tests --junitxml=report.xml"

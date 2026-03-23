@@ -1,0 +1,53 @@
+# Version control
+.git/
+.gitignore
+
+# Python caches
+__pycache__/
+*.py[cod]
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+coverage.xml
+report.xml
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# macOS-specific KDB-X installation — exclude the whole tree except the
+# ax-libraries.zip which is used to install qcumber inside the Linux image.
+developer-1.5.4-osx/
+!developer-1.5.4-osx/ax-libraries.zip
+
+# Local logs (runtime, not needed in image)
+logs/
+*.log
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test artefacts
+tests/__pycache__/
+.pytest_cache/
+
+# Build artefacts
+dist/
+build/
+*.egg-info/
+
+# Secrets / env files
+.env
+*.env
+
+# Screenshots / docs not needed at runtime
+screenshots/
+article-kdb-sdlc-loop.md
+mcp-clients/

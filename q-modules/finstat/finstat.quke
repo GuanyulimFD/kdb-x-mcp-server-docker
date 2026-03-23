@@ -1,0 +1,293 @@
+// =============================================================================
+// Unit tests for the .finstat module
+// File   : q-modules/finstat/finstat.quke
+// Runner : qcumber  (run via kdbx_q_unit_test MCP tool)
+//
+// IMPORTANT - use absolute path in setup_code when calling via MCP tool:
+//   system "l /path/to/kdb-x-mcp-server/q-modules/finstat/finstat.q"
+//
+// Key rules:
+//   - Use .[f;args;handler] for multi-arg error trapping, NOT @[f;args;handler]
+//   - Use inline literals; before each :: assignments are unreliable in qcumber
+//   - Use tolerance-based float comparison: 1e-6 > abs expected - actual
+// =============================================================================
+
+feature finstat module loads correctly
+
+    before
+        if[not `finstat in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/finstat/finstat.q"; "/app/q-modules/finstat/finstat.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/finstat/finstat.q"]
+        ]
+
+    should expose all public API symbols in .finstat namespace
+
+        expect sma exists
+            `sma in key `.finstat
+
+        expect ema exists
+            `ema in key `.finstat
+
+        expect simpleReturns exists
+            `simpleReturns in key `.finstat
+
+        expect logReturns exists
+            `logReturns in key `.finstat
+
+        expect rollingVol exists
+            `rollingVol in key `.finstat
+
+        expect vwap exists
+            `vwap in key `.finstat
+
+        expect cumulativeReturn exists
+            `cumulativeReturn in key `.finstat
+
+        expect sharpe exists
+            `sharpe in key `.finstat
+
+        expect maxDrawdown exists
+            `maxDrawdown in key `.finstat
+
+feature .finstat.sma
+
+    before
+        if[not `finstat in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/finstat/finstat.q"; "/app/q-modules/finstat/finstat.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/finstat/finstat.q"]
+        ]
+
+    should return correct moving averages
+
+        expect output length equals input length
+            6 = count .finstat.sma[100 102 101 105 104 108f; 3]
+
+        expect last value is average of 105 104 108
+            1e-3 > abs 105.6667f - last .finstat.sma[100 102 101 105 104 108f; 3]
+
+        expect window 1 is identity
+            .qu.compare[100 102 101 105 104 108f; .finstat.sma[100 102 101 105 104 108f; 1]]
+
+    should signal on bad inputs
+
+        expect error on empty prices
+            .[.finstat.sma; (0#0f; 3); {1b}]
+
+        expect error on window zero
+            .[.finstat.sma; (100 102 101f; 0); {1b}]
+
+feature .finstat.ema
+
+    before
+        if[not `finstat in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/finstat/finstat.q"; "/app/q-modules/finstat/finstat.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/finstat/finstat.q"]
+        ]
+
+    should compute EMA correctly with alpha 0.5
+
+        expect seed equals first price
+            100f = first .finstat.ema[100 102 101 105 104 108f; 0.5f]
+
+        expect output length equals input length
+            6 = count .finstat.ema[100 102 101 105 104 108f; 0.5f]
+
+        expect second element is 101 for alpha 0.5 on 100 then 102
+            101f = (.finstat.ema[100 102 101 105 104 108f; 0.5f])[1]
+
+        expect alpha 1.0 returns prices unchanged
+            .qu.compare[100 102 101 105 104 108f; .finstat.ema[100 102 101 105 104 108f; 1f]]
+
+    should signal on bad inputs
+
+        expect error on empty prices
+            .[.finstat.ema; (0#0f; 0.5f); {1b}]
+
+        expect error on alpha = 0
+            .[.finstat.ema; (100 102f; 0f); {1b}]
+
+        expect error on alpha > 1
+            .[.finstat.ema; (100 102f; 1.5f); {1b}]
+
+feature .finstat.simpleReturns
+
+    before
+        if[not `finstat in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/finstat/finstat.q"; "/app/q-modules/finstat/finstat.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/finstat/finstat.q"]
+        ]
+
+    should return arithmetic period-over-period returns
+
+        expect length is n-1
+            3 = count .finstat.simpleReturns[100 105 110 99f]
+
+        expect first return is 5 percent
+            .qu.compare[0.05f; first .finstat.simpleReturns[100 105 110 99f]]
+
+        expect last return is negative when price drops
+            0f > last .finstat.simpleReturns[100 105 110 99f]
+
+        expect flat series returns all zeros
+            all 0f = .finstat.simpleReturns[100 100 100f]
+
+    should signal on bad inputs
+
+        expect error on single price
+            .[.finstat.simpleReturns; enlist 100f; {1b}]
+
+
+feature .finstat.logReturns
+
+    before
+        if[not `finstat in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/finstat/finstat.q"; "/app/q-modules/finstat/finstat.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/finstat/finstat.q"]
+        ]
+
+    should return natural log returns
+
+        expect length is n-1
+            2 = count .finstat.logReturns[100 105 110f]
+
+        expect first log return close to ln 1.05
+            1e-6 > abs 0.04879016f - first .finstat.logReturns[100 105 110f]
+
+    should signal on bad inputs
+
+        expect error on single price
+            .[.finstat.logReturns; enlist 100f; {1b}]
+
+        expect error on zero price
+            .[.finstat.logReturns; 100 0 105f; {1b}]
+
+
+feature .finstat.rollingVol
+
+    before
+        if[not `finstat in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/finstat/finstat.q"; "/app/q-modules/finstat/finstat.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/finstat/finstat.q"]
+        ]
+
+    should return annualised volatility series
+
+        expect length equals input length
+            6 = count .finstat.rollingVol[100 102 101 105 104 108f; 3; 252]
+
+        expect values are non-negative where not null
+            r: .finstat.rollingVol[100 102 101 105 104 108f; 3; 252];
+            all 0f <= r where not null r
+
+    should signal on bad inputs
+
+        expect error on single price
+            .[.finstat.rollingVol; (enlist 100f; 3; 252); {1b}]
+
+        expect error on window less than 2
+            .[.finstat.rollingVol; (100 102 101f; 1; 252); {1b}]
+
+feature .finstat.vwap
+
+    before
+        if[not `finstat in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/finstat/finstat.q"; "/app/q-modules/finstat/finstat.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/finstat/finstat.q"]
+        ]
+
+    should compute volume-weighted average price
+
+        expect scalar float result
+            -9h = type .finstat.vwap[100 102 101f; 200 150 300]
+
+        expect value close to 100.92
+            0.01 > abs 100.923f - .finstat.vwap[100 102 101f; 200 150 300]
+
+        expect equal weights gives arithmetic mean
+            1e-5 > abs 101f - .finstat.vwap[100 102f; 1 1]
+
+    should signal on bad inputs
+
+        expect error on empty prices
+            .[.finstat.vwap; (0#0f; 0#0); {1b}]
+
+        expect error on mismatched lengths
+            .[.finstat.vwap; (100 102f; enlist 100); {1b}]
+
+        expect error on zero total volume
+            .[.finstat.vwap; (100 102f; 0 0); {1b}]
+
+
+feature .finstat.cumulativeReturn
+
+    before
+        if[not `finstat in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/finstat/finstat.q"; "/app/q-modules/finstat/finstat.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/finstat/finstat.q"]
+        ]
+
+    should compute total fractional return
+
+        expect 10 pct gain from 100 to 110
+            .qu.compare[0.1f; .finstat.cumulativeReturn[100 105 110f]]
+
+        expect zero for flat prices
+            .qu.compare[0f; .finstat.cumulativeReturn[100 100f]]
+
+        expect negative for declining series
+            0f > .finstat.cumulativeReturn[100 90f]
+
+    should signal on bad inputs
+
+        expect error on single price
+            .[.finstat.cumulativeReturn; enlist 100f; {1b}]
+
+
+feature .finstat.sharpe
+
+    before
+        if[not `finstat in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/finstat/finstat.q"; "/app/q-modules/finstat/finstat.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/finstat/finstat.q"]
+        ]
+
+    should return annualised Sharpe ratio
+
+        expect result is float scalar
+            -9h = type .finstat.sharpe[0.01 0.02 -0.005 0.015 0.008f; 0f; 252]
+
+        expect positive sharpe for positive-mean return series
+            0f < .finstat.sharpe[0.01 0.02 -0.005 0.015 0.008f; 0f; 252]
+
+        expect higher risk-free rate reduces Sharpe
+            r: 0.01 0.02 -0.005 0.015 0.008f;
+            .finstat.sharpe[r; 0.1f; 252] < .finstat.sharpe[r; 0f; 252]
+
+    should return null for constant return series
+
+        expect null when stddev is zero
+            0n = .finstat.sharpe[5#0.01f; 0f; 252]
+
+    should signal on bad inputs
+
+        expect error on empty returns
+            .[.finstat.sharpe; (0#0f; 0f; 252); {1b}]
+
+
+feature .finstat.maxDrawdown
+
+    before
+        if[not `finstat in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/finstat/finstat.q"; "/app/q-modules/finstat/finstat.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/finstat/finstat.q"]
+        ]
+
+    should compute maximum peak-to-trough drawdown
+
+        expect result is non-positive
+            0f >= .finstat.maxDrawdown[100 110 95 105 90f]
+
+        expect approx 18 pct drawdown from 110 to 90
+            1e-4 > abs -0.181818f - .finstat.maxDrawdown[100 110 95 105 90f]
+
+        expect zero for monotonically rising series
+            0f = .finstat.maxDrawdown[100 102 104 106f]
+
+        expect negative for any single decline
+            0f > .finstat.maxDrawdown[100 99f]
+
+    should signal on bad inputs
+
+        expect error on empty prices
+            .[.finstat.maxDrawdown; enlist 0#0f; {1b}]
+

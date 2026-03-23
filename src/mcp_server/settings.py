@@ -55,6 +55,17 @@ class KDBConfig(BaseSettings):
         default=5,
         description="Default number of results to return from vector searches [env: KDBX_DB_K]"
     )
+    qcumber_path: str = Field(
+        default="",
+        description=(
+            "Absolute path to qcumber.q_ from ax-libraries. "
+            "If unset, the server checks vendor/ax-libraries/ws/qcumber.q_ first "
+            "(installed via scripts/install_ax_libraries.sh), then AXLIBRARIES_HOME, "
+            "then the common ~/developer-*/ax-libraries glob. "
+            "Download KX Analyst from https://code.kx.com/developer/getting-started/ "
+            "[env: KDBX_DB_QCUMBER_PATH]"
+        )
+    )
 
 
 
@@ -74,6 +85,15 @@ class ServerConfig(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="INFO",
         description="Logging verbosity level [env: KDBX_MCP_LOG_LEVEL]"
+    )
+    log_file: str = Field(
+        default="",
+        description=(
+            "Path to a shared log file to append to instead of auto-creating one. "
+            "When set (or via KDBX_LOG_FILE env var), both the MCP server and the "
+            "KDB-X q process can be directed to the same file by start_all.sh. "
+            "[env: KDBX_MCP_LOG_FILE]"
+        )
     )
     transport: Literal["stdio", "streamable-http"] = Field(
         default="streamable-http",

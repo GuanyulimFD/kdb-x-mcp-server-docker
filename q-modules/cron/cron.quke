@@ -1,0 +1,314 @@
+// =============================================================================
+// Unit tests for the .cron module
+// File   : q-modules/cron/cron.quke
+// Runner : qcumber  (run via kdbx_q_unit_test MCP tool)
+//
+// IMPORTANT — use absolute path in setup_code when calling via MCP tool:
+//   system "l /path/to/kdb-x-mcp-server/q-modules/cron/cron.q"
+//
+// Notes:
+//   - All features force-reload the module each time to guarantee a clean state.
+//   - Job names are unique per feature to avoid cross-feature interference.
+//   - Time window 00:00:00.000 to 0Nt (null endTime) matches every time of day.
+//   - tick_[] is called directly (no system timer needed for unit tests).
+//   - Side-effects are captured via global variables set by test lambdas.
+//   - .[f;args;handler] is used for multi-arg error trapping (NOT @).
+// =============================================================================
+
+feature cron module loads correctly
+
+    before
+        system "l ", $[count key hsym `$"/app/q-modules/cron/cron.q"; "/app/q-modules/cron/cron.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/cron/cron.q"]
+
+    should expose all public API symbols in .cron namespace
+
+        expect add exists
+            `add in key `.cron
+
+        expect remove exists
+            `remove in key `.cron
+
+        expect enable exists
+            `enable in key `.cron
+
+        expect disable exists
+            `disable in key `.cron
+
+        expect list exists
+            `list in key `.cron
+
+        expect setPeriod exists
+            `setPeriod in key `.cron
+
+        expect setTimerMs exists
+            `setTimerMs in key `.cron
+
+        expect start exists
+            `start in key `.cron
+
+        expect stop exists
+            `stop in key `.cron
+
+    should initialise with an empty jobs table
+
+        expect jobs table exists
+            `jobs in key `.cron
+
+        expect jobs table has zero rows initially
+            0 = count .cron.jobs
+
+        expect jobs table has expected columns
+            `name`startTime`endTime`fn`args`period`disabled`lastRun ~ cols .cron.jobs
+
+feature .cron.add
+
+    before
+        system "l ", $[count key hsym `$"/app/q-modules/cron/cron.q"; "/app/q-modules/cron/cron.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/cron/cron.q"]
+
+    should register a new job and return its name
+
+        expect returned symbol equals job name
+            `j1 ~ .cron.add[`j1; 09:00:00.000; 17:00:00.000; {x+1}; enlist 1; 0b]
+
+        expect job appears in table
+            .cron.add[`j2; 09:00:00.000; 0Nt; {[]}; (); 0b];
+            `j2 in exec .cron.jobs`name
+
+        expect job is inserted with correct startTime
+            .cron.add[`j3; 08:30:00.000; 0Nt; {[]}; (); 0b];
+            08:30:00.000 = exec first startTime from .cron.jobs where name=`j3
+
+        expect job is inserted with null endTime when 0Nt passed
+            .cron.add[`j4; 08:00:00.000; 0Nt; {[]}; (); 0b];
+            null exec first endTime from .cron.jobs where name=`j4
+
+        expect job is inserted with period 0 by default
+            .cron.add[`j5; 08:00:00.000; 0Nt; {[]}; (); 0b];
+            0 = exec first period from .cron.jobs where name=`j5
+
+        expect job is inserted with lastRun null by default
+            .cron.add[`j6; 08:00:00.000; 0Nt; {[]}; (); 0b];
+            null exec first lastRun from .cron.jobs where name=`j6
+
+        expect disabled flag is stored correctly when true
+            .cron.add[`j7; 08:00:00.000; 0Nt; {[]}; (); 1b];
+            1b = exec first disabled from .cron.jobs where name=`j7
+
+    should signal on duplicate job name
+
+        expect error on second add with same name
+            .cron.add[`dup1; 09:00:00.000; 0Nt; {[]}; (); 0b];
+            .[.cron.add; (`dup1; 09:00:00.000; 0Nt; {[]}; (); 0b); {1b}]
+
+    should signal on bad input types
+
+        expect error when name is not a symbol
+            .[.cron.add; ("notasym"; 09:00:00.000; 0Nt; {[]}; (); 0b); {1b}]
+
+        expect error when startTime is not a time scalar
+            .[.cron.add; (`badtype; 2024.01.01; 0Nt; {[]}; (); 0b); {1b}]
+
+        expect error when disabled is not a boolean scalar
+            .[.cron.add; (`badtype2; 09:00:00.000; 0Nt; {[]}; (); 0); {1b}]
+
+feature .cron.remove
+
+    before
+        system "l ", $[count key hsym `$"/app/q-modules/cron/cron.q"; "/app/q-modules/cron/cron.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/cron/cron.q"]
+        .cron.add[`rjob1; 09:00:00.000; 0Nt; {[]}; (); 0b]
+        .cron.add[`rjob2; 09:00:00.000; 0Nt; {[]}; (); 0b]
+
+    should remove an existing job and return its name
+
+        expect returns job name
+            `rjob1 ~ .cron.remove[`rjob1]
+
+        expect job is no longer in table after remove
+            .cron.remove[`rjob2];
+            not `rjob2 in exec .cron.jobs`name
+
+    should not signal when removing a non-existent job
+
+        expect no error for unknown name
+            not `ghost in exec .cron.jobs`name;
+            .cron.remove[`ghost];
+            1b
+
+feature .cron.enable and .cron.disable
+
+    before
+        system "l ", $[count key hsym `$"/app/q-modules/cron/cron.q"; "/app/q-modules/cron/cron.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/cron/cron.q"]
+        .cron.add[`toggler; 09:00:00.000; 0Nt; {[]}; (); 0b]
+
+    should disable an active job
+
+        expect disabled flag becomes true
+            .cron.disable[`toggler];
+            1b = exec first disabled from .cron.jobs where name=`toggler
+
+    should enable a disabled job
+
+        expect disabled flag becomes false
+            .cron.disable[`toggler];
+            .cron.enable[`toggler];
+            0b = exec first disabled from .cron.jobs where name=`toggler
+
+    should return the job name
+
+        expect disable returns name
+            `toggler ~ .cron.disable[`toggler]
+
+        expect enable returns name
+            .cron.disable[`toggler];
+            `toggler ~ .cron.enable[`toggler]
+
+    should signal on non-existent job name
+
+        expect disable errors for unknown job
+            .[.cron.disable; (enlist `noexist); {1b}]
+
+        expect enable errors for unknown job
+            .[.cron.enable; (enlist `noexist); {1b}]
+
+feature .cron.list
+
+    before
+        system "l ", $[count key hsym `$"/app/q-modules/cron/cron.q"; "/app/q-modules/cron/cron.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/cron/cron.q"]
+
+    should return a table of all jobs
+
+        expect empty table when no jobs registered
+            0 = count .cron.list[]
+
+        expect table grows after add
+            .cron.add[`lj1; 09:00:00.000; 0Nt; {[]}; (); 0b];
+            .cron.add[`lj2; 10:00:00.000; 0Nt; {[]}; (); 0b];
+            2 = count .cron.list[]
+
+        expect return type is table
+            98h = type .cron.list[]
+
+feature .cron.setPeriod
+
+    before
+        system "l ", $[count key hsym `$"/app/q-modules/cron/cron.q"; "/app/q-modules/cron/cron.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/cron/cron.q"]
+        .cron.add[`pjob; 09:00:00.000; 0Nt; {[]}; (); 0b]
+
+    should update the period for an existing job
+
+        expect period is updated to the given value
+            .cron.setPeriod[`pjob; 5000];
+            5000 = exec first period from .cron.jobs where name=`pjob
+
+        expect returns the job name
+            `pjob ~ .cron.setPeriod[`pjob; 1000]
+
+        expect period can be set to zero
+            .cron.setPeriod[`pjob; 0];
+            0 = exec first period from .cron.jobs where name=`pjob
+
+    should signal on invalid inputs
+
+        expect error on negative period
+            .[.cron.setPeriod; (`pjob; -1); {1b}]
+
+        expect error on non-existent job
+            .[.cron.setPeriod; (`ghost; 1000); {1b}]
+
+feature .cron.processRow_
+
+    before
+        system "l ", $[count key hsym `$"/app/q-modules/cron/cron.q"; "/app/q-modules/cron/cron.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/cron/cron.q"]
+
+    should execute the job function and update lastRun
+
+        expect lastRun is updated from null to a timestamp
+            .cron.add[`pr1; 00:00:00.000; 0Nt; {[]}; (); 0b];
+            before_ts: .z.p;
+            .cron.processRow_[first 0!select from .cron.jobs where name=`pr1];
+            not null exec first lastRun from .cron.jobs where name=`pr1
+
+        expect lastRun is >= timestamp before execution
+            .cron.add[`pr2; 00:00:00.000; 0Nt; {[]}; (); 0b];
+            t0: .z.p;
+            .cron.processRow_[first 0!select from .cron.jobs where name=`pr2];
+            (exec first lastRun from .cron.jobs where name=`pr2) >= t0
+
+    should invoke the function with provided arguments
+
+        expect fn receives args correctly (counter incremented)
+            .cron.cronTestCounter_ :: 0;
+            .cron.add[`pr3; 00:00:00.000; 0Nt; {.cron.cronTestCounter_ +: x}; enlist 5; 0b];
+            .cron.processRow_[first 0!select from .cron.jobs where name=`pr3];
+            5 = .cron.cronTestCounter_
+
+    should not signal when function raises an error
+
+        expect no exception propagated from a failing job
+            .cron.add[`pr4; 00:00:00.000; 0Nt; {'`intentionalError}; (); 0b];
+            .cron.processRow_[first 0!select from .cron.jobs where name=`pr4];
+            1b
+
+feature .cron.tick_
+
+    before
+        system "l ", $[count key hsym `$"/app/q-modules/cron/cron.q"; "/app/q-modules/cron/cron.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/cron/cron.q"]
+
+    should execute jobs within the active time window
+
+        expect lastRun is set on a job with a window covering all day
+            .cron.cronTickCounter_ :: 0;
+            .cron.add[`tk1; 00:00:00.000; 0Nt; {.cron.cronTickCounter_ +: 1}; (); 0b];
+            .cron.tick_[];
+            1 = .cron.cronTickCounter_
+
+    should skip disabled jobs
+
+        expect disabled job is not executed
+            .cron.cronSkipCounter_ :: 0;
+            .cron.add[`tk2; 00:00:00.000; 0Nt; {.cron.cronSkipCounter_ +: 1}; (); 1b];
+            .cron.tick_[];
+            0 = .cron.cronSkipCounter_
+
+    should skip jobs whose startTime is in the future
+
+        expect job with startTime 23:59:59.999 is not run before that time
+            .cron.cronFutureCounter_ :: 0;
+            .cron.add[`tk3; 23:59:59.999; 0Nt; {.cron.cronFutureCounter_ +: 1}; (); 0b];
+            / only skip during test if current time < 23:59:59.999 (safe for CI)
+            $[.z.t < 23:59:59.999;
+                [.cron.tick_[]; 0 = .cron.cronFutureCounter_];
+                1b
+            ]
+
+    should skip jobs whose endTime has passed
+
+        expect job with endTime 00:00:00.001 is not run after that time
+            .cron.cronExpiredCounter_ :: 0;
+            .cron.add[`tk4; 00:00:00.000; 00:00:00.001; {.cron.cronExpiredCounter_ +: 1}; (); 0b];
+            $[.z.t > 00:00:00.001;
+                [.cron.tick_[]; 0 = .cron.cronExpiredCounter_];
+                1b
+            ]
+
+    should respect period and not re-run a job before its period elapses
+
+        expect job with large period and recent lastRun is skipped
+            .cron.cronPeriodCounter_ :: 0;
+            .cron.add[`tk5; 00:00:00.000; 0Nt; {.cron.cronPeriodCounter_ +: 1}; (); 0b];
+            / Simulate recent lastRun by force-updating
+            update lastRun:.z.p from `.cron.jobs where name=`tk5;
+            .cron.setPeriod[`tk5; 3600000];   / 1-hour period
+            .cron.tick_[];
+            0 = .cron.cronPeriodCounter_
+
+    should run a job whose period has fully elapsed
+
+        expect job with elapsed period is executed
+            .cron.cronElapsedCounter_ :: 0;
+            .cron.add[`tk6; 00:00:00.000; 0Nt; {.cron.cronElapsedCounter_ +: 1}; (); 0b];
+            / Set lastRun to 2 hours ago
+            update lastRun:(.z.p - 0D02:00:00.000000000) from `.cron.jobs where name=`tk6;
+            .cron.setPeriod[`tk6; 3600000];   / 1-hour period
+            .cron.tick_[];
+            1 = .cron.cronElapsedCounter_

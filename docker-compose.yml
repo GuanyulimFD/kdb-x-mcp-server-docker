@@ -1,0 +1,82 @@
+# ---------------------------------------------------------------------------
+# docker-compose.yml - KDB-X MCP Server
+#
+# Everything is baked into the image at build time:
+#   - KDB-X binary + license
+#   - ax-libraries (qcumber, qlint, profiler, ...)
+#
+# Quick start:
+#   1. cp .env.example .env  && edit it (3 secrets + 1 URL)
+#   2. docker compose build
+#   3. docker compose up
+#   4. tail -f logs/kdbx_mcp_*.log    # unified real-time log
+#
+# Volume mounts at runtime:
+#   ./logs       → /app/logs        (unified log stream)
+#   ./q-modules  → /app/q-modules   (live-reloadable q modules — no rebuild needed)
+# ---------------------------------------------------------------------------
+
+secrets:
+  kx_bearer:
+    # The KX portal bearer token is read from the host env var KX_BEARER_TOKEN
+    # and passed as a BuildKit secret - it is NEVER written to any image layer.
+    environment: KX_BEARER_TOKEN
+
+services:
+  kdbx-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        KX_B64LIC: "${KX_B64LIC}"
+        # l64=x86_64  l64arm=aarch64 (Apple Silicon / AWS Graviton)
+        # install_kdb.sh auto-detects arch; ax-libraries also auto-selects
+        # the correct platform-specific .so set (including ubuntu16_arm64).
+        KX_ARCH: "${KX_ARCH:-l64}"
+      secrets:
+        - kx_bearer
+
+    image: kdbx-mcp-server:latest
+    container_name: kdbx-mcp
+
+    ports:
+      # MCP HTTP endpoint for AI clients (VS Code Copilot, Claude, etc.)
+      - "${MCP_HOST_PORT:-8000}:8000"
+
+    environment:
+      KDBX_DB_PORT: "${KDBX_DB_PORT:-5001}"
+      KDBX_DB_HOST: "127.0.0.1"
+      KDBX_MCP_PORT: "8000"
+      KDBX_MCP_HOST: "0.0.0.0"
+      KDBX_MCP_TRANSPORT: "streamable-http"
+      KDBX_MCP_LOG_LEVEL: "${KDBX_MCP_LOG_LEVEL:-INFO}"
+      # qcumber path is baked in - matches ENV in Dockerfile
+      KDBX_DB_QCUMBER_PATH: "/root/.kx/ax-libraries/ws/qcumber.q_"
+
+    volumes:
+      # Unified log volume - both KDB-X and MCP server write here.
+      # Tail from the host: tail -f ./logs/kdbx_mcp_*.log
+      - "${LOG_DIR_HOST:-./logs}:/app/logs"
+      # Live q-module mount - changes on the host are immediately visible inside
+      # the container. Use kdbx_q_eval to reload: system "l q-modules/<name>/<name>.q"
+      - "./q-modules:/app/q-modules"
+
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+    restart: unless-stopped
+
+    # Healthcheck verifies both the KDB-X q port and the MCP HTTP port are up
+    healthcheck:
+      test: >
+        bash -c '
+          lsof -iTCP:8000 -sTCP:LISTEN -t >/dev/null 2>&1 &&
+          lsof -iTCP:5001 -sTCP:LISTEN -t >/dev/null 2>&1
+        '
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3

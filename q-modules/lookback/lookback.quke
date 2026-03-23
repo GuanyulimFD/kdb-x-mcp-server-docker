@@ -1,0 +1,283 @@
+// =============================================================================
+// Unit tests for the .lookback module
+// File   : q-modules/lookback/lookback.quke
+// Runner : qcumber  (run via kdbx_q_unit_test MCP tool)
+//
+// Test data layout
+// ----------------
+//   Quote table (qt): 5 rows for AAPL / NYSE, times at:
+//     T+0s  → bid=100.0  ask=100.1  (T = 2024.01.15D09:30:00)
+//     T+30s → bid=100.2  ask=100.3
+//     T+60s → bid=100.4  ask=100.5
+//     T+5m  → bid=100.6  ask=100.7
+//     T+6m  → bid=100.8  ask=100.9
+//
+//   Trade table (tt): 1 row for AAPL / NYSE at T+6m+5s = 09:36:05
+//
+//   Expected lookback results for the trade at 09:36:05
+//     t0   (offset    0) → shifted 09:36:05 → last quote 09:36:00 → bid=100.8
+//     t30s (offset  30s) → shifted 09:35:35 → last quote 09:35:00 → bid=100.6
+//     t1m  (offset   1m) → shifted 09:35:05 → last quote 09:35:00 → bid=100.6
+//     t5m  (offset   5m) → shifted 09:31:05 → last quote 09:31:00 → bid=100.4
+//
+// Notes:
+//   - Use .[fn; args; {1b}] for multi-arg error trapping (NOT @)
+//   - All before blocks use portable Docker/local path detection
+//   - Test tables are defined as globals (::) in before blocks
+// =============================================================================
+
+feature lookback module loads correctly
+
+    before
+        system "l ", $[count key hsym `$"/app/q-modules/lookback/lookback.q"; "/app/q-modules/lookback/lookback.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/lookback/lookback.q"]
+
+    should expose all public API symbols in .lookback namespace
+
+        expect defaultOffsets exists
+            `defaultOffsets in key `.lookback
+
+        expect snapAt exists
+            `snapAt in key `.lookback
+
+        expect multiSnap exists
+            `multiSnap in key `.lookback
+
+        expect nbboAt exists
+            `nbboAt in key `.lookback
+
+feature .lookback.defaultOffsets
+
+    before
+        system "l ", $[count key hsym `$"/app/q-modules/lookback/lookback.q"; "/app/q-modules/lookback/lookback.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/lookback/lookback.q"]
+
+    should return a dict with four standard horizons
+
+        expect result is a dict
+            99h = type .lookback.defaultOffsets[]
+
+        expect keys are t0 t30s t1m t5m
+            `t0`t30s`t1m`t5m ~ key .lookback.defaultOffsets[]
+
+        expect t0 offset is zero timespan
+            0D00:00:00 = .lookback.defaultOffsets[]`t0
+
+        expect t30s offset is 30 seconds
+            0D00:00:30 = .lookback.defaultOffsets[]`t30s
+
+        expect t1m offset is 60 seconds
+            0D00:01:00 = .lookback.defaultOffsets[]`t1m
+
+        expect t5m offset is 5 minutes
+            0D00:05:00 = .lookback.defaultOffsets[]`t5m
+
+feature .lookback.snapAt
+
+    before
+        system "l ", $[count key hsym `$"/app/q-modules/lookback/lookback.q"; "/app/q-modules/lookback/lookback.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/lookback/lookback.q"]
+        qt :: ([] time: 2024.01.15D09:30:00.000000000 + 0D00:00:00 0D00:00:30 0D00:01:00 0D00:05:00 0D00:06:00; sym: 5#`AAPL; venue: 5#`NYSE; bid: 100.0 100.2 100.4 100.6 100.8; ask: 100.1 100.3 100.5 100.7 100.9; bSize: 100 150 200 250 300; aSize: 100 150 200 250 300)
+        tt :: ([] time: enlist 2024.01.15D09:36:05.000000000; sym: enlist `AAPL; venue: enlist `NYSE; price: enlist 100.85f; sz: enlist 10)
+
+    should return trade row count unchanged
+
+        expect row count preserved
+            1 = count .lookback.snapAt[qt; tt; `sym`venue; `t0; 0D00:00:00; `bid`ask]
+
+    should add suffixed columns for the horizon label
+
+        expect bid_t0 column exists in result
+            `bid_t0 in cols .lookback.snapAt[qt; tt; `sym`venue; `t0; 0D00:00:00; `bid`ask]
+
+        expect ask_t0 column exists in result
+            `ask_t0 in cols .lookback.snapAt[qt; tt; `sym`venue; `t0; 0D00:00:00; `bid`ask]
+
+        expect original trade columns are preserved
+            all `price`sz in cols .lookback.snapAt[qt; tt; `sym`venue; `t0; 0D00:00:00; `bid`ask]
+
+    should retrieve the correct quote at t0 offset (current)
+
+        expect bid at t0 is 100.8 — last quote at 09:36:00
+            r: .lookback.snapAt[qt; tt; `sym`venue; `t0; 0D00:00:00; `bid`ask];
+            100.8 = first r`bid_t0
+
+        expect ask at t0 is 100.9
+            r: .lookback.snapAt[qt; tt; `sym`venue; `t0; 0D00:00:00; `bid`ask];
+            100.9 = first r`ask_t0
+
+    should retrieve the correct quote at t30s offset (30 seconds back)
+
+        expect bid at t30s is 100.6 — shifted to 09:35:35, last quote 09:35:00
+            r: .lookback.snapAt[qt; tt; `sym`venue; `t30s; 0D00:00:30; `bid`ask];
+            100.6 = first r`bid_t30s
+
+        expect ask at t30s is 100.7
+            r: .lookback.snapAt[qt; tt; `sym`venue; `t30s; 0D00:00:30; `bid`ask];
+            100.7 = first r`ask_t30s
+
+    should retrieve the correct quote at t5m offset (5 minutes back)
+
+        expect bid at t5m is 100.4 — shifted to 09:31:05, last quote 09:31:00
+            r: .lookback.snapAt[qt; tt; `sym`venue; `t5m; 0D00:05:00; `bid`ask];
+            100.4 = first r`bid_t5m
+
+        expect ask at t5m is 100.5
+            r: .lookback.snapAt[qt; tt; `sym`venue; `t5m; 0D00:05:00; `bid`ask];
+            100.5 = first r`ask_t5m
+
+    should return null values when no prior quote exists for the horizon
+
+        expect bid is null when trade time minus offset precedes all quotes
+            r: .lookback.snapAt[qt; tt; `sym`venue; `tEarly; 0D00:10:00; `bid`ask];
+            null first r`bid_tEarly
+
+    should work with multiple quote columns simultaneously
+
+        expect four columns added for bid ask bSize aSize
+            r: .lookback.snapAt[qt; tt; `sym`venue; `t0; 0D00:00:00; `bid`ask`bSize`aSize];
+            `bid_t0`ask_t0`bSize_t0`aSize_t0 in cols r
+
+    should handle an empty trade table gracefully
+
+        expect empty trade table returns empty result
+            emptyTT: 0#tt;
+            r: .lookback.snapAt[qt; emptyTT; `sym`venue; `t0; 0D00:00:00; `bid`ask];
+            0 = count r
+
+    should signal on bad inputs
+
+        expect error when qt is not a table
+            .[.lookback.snapAt; (([]a:1 2); `notATable; `sym`venue; `t0; 0D00:00:00; `bid`ask); {1b}]
+
+        expect error when joinCols missing from tt
+            badTT: ([] time: enlist 2024.01.15D09:36:05.000000000; price: enlist 100f);
+            .[.lookback.snapAt; (qt; badTT; `sym`venue; `t0; 0D00:00:00; `bid`ask); {1b}]
+
+        expect error when quoteCols missing from qt
+            .[.lookback.snapAt; (qt; tt; `sym`venue; `t0; 0D00:00:00; `bid`ask`vwap); {1b}]
+
+feature .lookback.multiSnap
+
+    before
+        system "l ", $[count key hsym `$"/app/q-modules/lookback/lookback.q"; "/app/q-modules/lookback/lookback.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/lookback/lookback.q"]
+        qt :: ([] time: 2024.01.15D09:30:00.000000000 + 0D00:00:00 0D00:00:30 0D00:01:00 0D00:05:00 0D00:06:00; sym: 5#`AAPL; venue: 5#`NYSE; bid: 100.0 100.2 100.4 100.6 100.8; ask: 100.1 100.3 100.5 100.7 100.9; bSize: 100 150 200 250 300; aSize: 100 150 200 250 300)
+        tt :: ([] time: enlist 2024.01.15D09:36:05.000000000; sym: enlist `AAPL; venue: enlist `NYSE; price: enlist 100.85f; sz: enlist 10)
+
+    should add columns for every horizon
+
+        expect all 8 bid/ask columns present for defaultOffsets
+            r: .lookback.multiSnap[qt; tt; `sym`venue; .lookback.defaultOffsets[]; `bid`ask];
+            all `bid_t0`ask_t0`bid_t30s`ask_t30s`bid_t1m`ask_t1m`bid_t5m`ask_t5m in cols r
+
+    should return correct bid values at all four horizons
+
+        expect bid_t0 is 100.8
+            r: .lookback.multiSnap[qt; tt; `sym`venue; .lookback.defaultOffsets[]; `bid`ask];
+            100.8 = first r`bid_t0
+
+        expect bid_t30s is 100.6
+            r: .lookback.multiSnap[qt; tt; `sym`venue; .lookback.defaultOffsets[]; `bid`ask];
+            100.6 = first r`bid_t30s
+
+        expect bid_t1m is 100.6
+            r: .lookback.multiSnap[qt; tt; `sym`venue; .lookback.defaultOffsets[]; `bid`ask];
+            100.6 = first r`bid_t1m
+
+        expect bid_t5m is 100.4
+            r: .lookback.multiSnap[qt; tt; `sym`venue; .lookback.defaultOffsets[]; `bid`ask];
+            100.4 = first r`bid_t5m
+
+    should preserve original trade table columns
+
+        expect price and sz columns unchanged
+            r: .lookback.multiSnap[qt; tt; `sym`venue; .lookback.defaultOffsets[]; `bid`ask];
+            100.85f = first r`price
+
+    should work with custom offset dictionaries
+
+        expect custom 10s and 2m horizons produce correct column names
+            r: .lookback.multiSnap[qt; tt; `sym`venue; `h10s`h2m!0D00:00:10 0D00:02:00; `bid`ask];
+            `bid_h10s`ask_h10s`bid_h2m`ask_h2m in cols r
+
+    should return correct values for custom offset of 10 seconds
+
+        expect bid_h10s is 100.8 — shifted to 09:35:55, last quote at 09:35:00
+            r: .lookback.multiSnap[qt; tt; `sym`venue; `h10s`h2m!0D00:00:10 0D00:02:00; `bid`ask];
+            100.8 = first r`bid_h10s
+
+    should work with a single-horizon offsets dict
+
+        expect single offset produces correct result
+            r: .lookback.multiSnap[qt; tt; `sym`venue; enlist[`only]!enlist 0D00:00:30; enlist `bid];
+            100.6 = first r`bid_only
+
+    should handle empty trade table
+
+        expect empty trades return empty result
+            r: .lookback.multiSnap[qt; 0#tt; `sym`venue; .lookback.defaultOffsets[]; `bid`ask];
+            0 = count r
+
+    should signal on bad inputs
+
+        expect error when offsets is not a dict
+            .[.lookback.multiSnap; (qt; tt; `sym`venue; `t0`t30s; `bid`ask); {1b}]
+
+        expect error when offsets is empty dict
+            .[.lookback.multiSnap; (qt; tt; `sym`venue; ()!(); `bid`ask); {1b}]
+
+feature .lookback.nbboAt
+
+    before
+        system "l ", $[count key hsym `$"/app/q-modules/lookback/lookback.q"; "/app/q-modules/lookback/lookback.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/lookback/lookback.q"]
+        qt :: ([] time: 2024.01.15D09:30:00.000000000 + 0D00:00:00 0D00:00:30 0D00:01:00 0D00:05:00 0D00:06:00; sym: 5#`AAPL; venue: 5#`NYSE; bid: 100.0 100.2 100.4 100.6 100.8; ask: 100.1 100.3 100.5 100.7 100.9; bSize: 100 150 200 250 300; aSize: 100 150 200 250 300)
+
+    should return correct bid and ask at 09:36:05
+
+        expect bid is 100.8
+            r: .lookback.nbboAt[qt; `AAPL; `NYSE; 2024.01.15D09:36:05.000000000; `bid`ask];
+            100.8 = r`bid
+
+        expect ask is 100.9
+            r: .lookback.nbboAt[qt; `AAPL; `NYSE; 2024.01.15D09:36:05.000000000; `bid`ask];
+            100.9 = r`ask
+
+    should return the earlier quote when timestamp is between quote times
+
+        expect bid is 100.4 at 09:31:30 — last quote at 09:31:00
+            r: .lookback.nbboAt[qt; `AAPL; `NYSE; 2024.01.15D09:31:30.000000000; `bid`ask];
+            100.4 = r`bid
+
+    should return null floats when no prior quote exists
+
+        expect bid is null before first quote
+            r: .lookback.nbboAt[qt; `AAPL; `NYSE; 2024.01.15D09:29:00.000000000; `bid`ask];
+            null r`bid
+
+        expect ask is null before first quote
+            r: .lookback.nbboAt[qt; `AAPL; `NYSE; 2024.01.15D09:29:00.000000000; `bid`ask];
+            null r`ask
+
+    should return null when sym does not exist in qt
+
+        expect result is all-null for unknown sym
+            r: .lookback.nbboAt[qt; `UNKNOWN; `NYSE; 2024.01.15D09:36:05.000000000; `bid`ask];
+            null r`bid
+
+    should return a dict with the requested quote columns
+
+        expect result is a dict
+            99h = type .lookback.nbboAt[qt; `AAPL; `NYSE; 2024.01.15D09:36:05.000000000; `bid`ask]
+
+        expect dict keys match quoteCols
+            r: .lookback.nbboAt[qt; `AAPL; `NYSE; 2024.01.15D09:36:05.000000000; `bid`ask`bSize`aSize];
+            `bid`ask`bSize`aSize ~ key r
+
+    should signal on bad inputs
+
+        expect error when qt is not a table
+            .[.lookback.nbboAt; (`notATable; `AAPL; `NYSE; 2024.01.15D09:36:05.000000000; `bid`ask); {1b}]
+
+        expect error when qt missing sym column
+            noSym: ([] time: enlist 2024.01.15D09:36:00.000000000; venue: enlist `NYSE; bid: enlist 100.8f; ask: enlist 100.9f);
+            .[.lookback.nbboAt; (noSym; `AAPL; `NYSE; 2024.01.15D09:36:05.000000000; `bid`ask); {1b}]
+
+        expect error when quoteCols missing from qt
+            .[.lookback.nbboAt; (qt; `AAPL; `NYSE; 2024.01.15D09:36:05.000000000; `bid`ask`spread); {1b}]

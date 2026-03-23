@@ -1,4 +1,5 @@
 import logging
+import time
 import numpy as np
 import pandas as pd
 from typing import Optional, Dict, Any
@@ -16,7 +17,12 @@ logger = logging.getLogger(__name__)
 async def kdbx_similarity_search_impl(table_name: str,
                                         query: str,
                                         n: Optional[int] = None) -> Dict[str, Any]:
-    
+    _n = n if n is not None else config.k
+    logger.info(
+        f"kdbx_similarity_search: starting | table={table_name!r}"
+        f" | query={query[:150]!r} | n={_n}"
+    )
+    t0 = time.perf_counter()
     try:
         if n is None:
             n = config.k
@@ -57,7 +63,11 @@ async def kdbx_similarity_search_impl(table_name: str,
                             ]}''', search_params)
 
         result = normalize_search_result(result.pd(), table_name)
-
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            f"kdbx_similarity_search: completed in {elapsed:.3f}s"
+            f" | table={table_name!r} | records={len(result)}"
+        )
         return {
             "status": "success",
             "table": table_name,
@@ -65,7 +75,11 @@ async def kdbx_similarity_search_impl(table_name: str,
             "records": result
         }
     except Exception as e:
-        logger.error(f"Error performing search on table {table_name}: {e}")
+        elapsed = time.perf_counter() - t0
+        logger.error(
+            f"kdbx_similarity_search: failed after {elapsed:.3f}s"
+            f" | table={table_name!r} | error={e!r}"
+        )
         return {
             "status": "error",
             "message": str(e),
@@ -76,16 +90,23 @@ async def kdbx_similarity_search_impl(table_name: str,
 async def kdbx_hybrid_search_impl(table_name: str,
                                     query: str,
                                     n: Optional[int] = None) -> Dict[str, Any]:
-    
+    _n = n if n is not None else config.k
+    logger.info(
+        f"kdbx_hybrid_search: starting | table={table_name!r}"
+        f" | query={query[:150]!r} | n={_n}"
+    )
+    t0 = time.perf_counter()
     try:
         if n is None:
             n = config.k
 
         embeddings_column, embeddings_provider, embeddings_model, _, sparse_index_name, sparse_tokenizer_provider, sparse_tokenizer_model = get_embedding_config(table_name)
 
-        # Check if it has index 
+        # Check if it has index
         if sparse_index_name is None:
-            logger.info(f"Error performing hybrid search on table {table_name}: Missing sparse index")
+            logger.warning(
+                f"kdbx_hybrid_search: missing sparse index | table={table_name!r}"
+            )
             return {
                     "status": "error",
                     "message": "The requested table does not have sparse index",
@@ -137,7 +158,11 @@ async def kdbx_hybrid_search_impl(table_name: str,
                             ]}''', search_params)
         
         if hasattr(result, '__len__') and len(result) == 0:
-            logger.info(f"Hybrid search on table {table_name} returned no results - sparse search may have found no matches")
+            elapsed = time.perf_counter() - t0
+            logger.info(
+                f"kdbx_hybrid_search: completed in {elapsed:.3f}s | table={table_name!r}"
+                f" | records=0 (sparse search returned no matches)"
+            )
             return {
                 "status": "success",
                 "table": table_name,
@@ -147,7 +172,11 @@ async def kdbx_hybrid_search_impl(table_name: str,
             }
 
         result = normalize_search_result(result.pd(), table_name)
-
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            f"kdbx_hybrid_search: completed in {elapsed:.3f}s"
+            f" | table={table_name!r} | records={len(result)}"
+        )
         return {
             "status": "success",
             "table": table_name,
@@ -155,7 +184,11 @@ async def kdbx_hybrid_search_impl(table_name: str,
             "records": result
         }
     except Exception as e:
-        logger.error(f"Error performing search on table {table_name}: {e}")
+        elapsed = time.perf_counter() - t0
+        logger.error(
+            f"kdbx_hybrid_search: failed after {elapsed:.3f}s"
+            f" | table={table_name!r} | error={e!r}"
+        )
         return {
             "status": "error",
             "message": str(e),

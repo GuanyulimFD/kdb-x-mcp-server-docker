@@ -1,0 +1,431 @@
+// =============================================================================
+// Unit tests for the .dataprofile module
+// File   : q-modules/dataprofile/dataprofile.quke
+// Runner : qcumber  (run via kdbx_q_unit_test MCP tool)
+//
+// IMPORTANT - supply setup_code when calling via MCP tool:
+//   system "l ", $[count key hsym `$"/app/q-modules/dataprofile/dataprofile.q"; "/app/q-modules/dataprofile/dataprofile.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/dataprofile/dataprofile.q"]
+//
+// For .dataprofile.cast and .dataprofile.suggestIngestion features, also
+// supply the following in setup_code (cast uses pre-computed globals to avoid
+// qcumber's `;`-in-expect parsing restrictions; suggestIngestion uses
+// compact proposal dicts that avoid the reserved-word `type` in inline tables):
+//
+//   dp_castPrice: .dataprofile.cast[([] price: ("100.5";"200.0";"50.25")); enlist[`price]!enlist "f"]
+//   dp_castInt:   .dataprofile.cast[([] size: ("100";"200";"300")); enlist[`size]!enlist "j"]
+//   dp_castSym:   .dataprofile.cast[([] sym: ("AAPL";"GOOG";"MSFT")); enlist[`sym]!enlist "*"]
+//   dp_castVar:   .dataprofile.cast[([] note: ("abc";"def";"ghi")); enlist[`note]!enlist " "]
+//   dp_castDate:  .dataprofile.cast[([] d: ("2024.01.01";"2024.01.02";"2024.01.03")); enlist[`d]!enlist "d"]
+//   dp_propDate:    `tableName`rowsSampled`colCount`profile`typeMap`typeStr`loadExpr!("trades";5;3;([] col:`date`sym`price);`date`sym`price!"d*f";"d*f";"tbl: (\"d*f\"; \",\") 0: hsym `$\"/tmp/t.csv\"")
+//   dp_propTs:      `tableName`rowsSampled`colCount`profile`typeMap`typeStr`loadExpr!("ticks";5;3;([] col:`ts`date`sym);`ts`date`sym!"pd*";"pd*";"tbl: (\"pd*\"; \",\") 0: hsym `$\"/tmp/t.csv\"")
+//   dp_propStrOnly: `tableName`rowsSampled`colCount`profile`typeMap`typeStr`loadExpr!("ref";3;2;([] col:`name`code);`name`code!"**";"**";"tbl: (\"**\"; \",\") 0: hsym `$\"/tmp/t.csv\"")
+//
+// Key rules (KDB-X 5.0 + qcumber):
+//   - Use .[f;args;handler] for multi-arg error trapping, NOT @[f;args;handler]
+//   - `before each :: assignments` are unreliable; prefer `before` or inline literals
+//   - Float equality: 1e-6 > abs expected - actual
+//   - File writes in before blocks use: `:/path/to/file 0: lines  (list of strings)
+//   - Single-entry type map: enlist[`col]!enlist "c"  (NOT `col!"c" - throws 'type)
+//   - `ss` uses wildcards (*); avoid searching for strings containing * with ss
+//   - Single-char string columns like ("1";"2";"3") become char vectors (not string lists);
+//     use multi-char values ("10";"20";"30") for tests that call profile[] with string cols
+// =============================================================================
+
+feature dataprofile module loads correctly
+
+    before
+        if[not `dataprofile in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/dataprofile/dataprofile.q"; "/app/q-modules/dataprofile/dataprofile.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/dataprofile/dataprofile.q"]
+        ]
+
+    should expose all public API symbols in .dataprofile namespace
+
+        expect peek is defined
+            `peek in key `.dataprofile
+
+        expect inferSchema is defined
+            `inferSchema in key `.dataprofile
+
+        expect cast is defined
+            `cast in key `.dataprofile
+
+        expect profile is defined
+            `profile in key `.dataprofile
+
+        expect proposeSchema is defined
+            `proposeSchema in key `.dataprofile
+
+        expect suggestIngestion is defined
+            `suggestIngestion in key `.dataprofile
+
+// =============================================================================
+// .dataprofile.peek
+// =============================================================================
+
+feature .dataprofile.peek
+
+    before
+        if[not `dataprofile in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/dataprofile/dataprofile.q"; "/app/q-modules/dataprofile/dataprofile.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/dataprofile/dataprofile.q"]
+        ]
+        `:/tmp/dp_quke.csv 0: ("date,sym,price,size,exchange";
+                               "2024.01.01,AAPL,100.5,1000,NYSE";
+                               "2024.01.02,GOOG,200.0,500,NASDAQ";
+                               "2024.01.03,MSFT,50.25,2000,NYSE";
+                               "2024.01.04,AMZN,300.0,750,NASDAQ";
+                               "2024.01.05,TSLA,180.0,1200,NYSE")
+
+    should return an all-string table with correct shape
+
+        expect row count equals n when file has enough rows
+            5 = count .dataprofile.peek["/tmp/dp_quke.csv"; ","; 10]
+
+        expect column names are taken from header row
+            `date`sym`price`size`exchange ~ cols .dataprofile.peek["/tmp/dp_quke.csv"; ","; 10]
+
+        expect all column values are general string lists (type 0h per column)
+            all 0h = type each value flip .dataprofile.peek["/tmp/dp_quke.csv"; ","; 10]
+
+        expect n parameter limits returned row count
+            3 = count .dataprofile.peek["/tmp/dp_quke.csv"; ","; 3]
+
+        expect n=1 returns exactly one row
+            1 = count .dataprofile.peek["/tmp/dp_quke.csv"; ","; 1]
+
+        expect raw string value is preserved
+            "AAPL" ~ first .dataprofile.peek["/tmp/dp_quke.csv"; ","; 5][`sym]
+
+    should signal on invalid inputs
+
+        expect error on empty path string
+            .[.dataprofile.peek; (""; ","; 5); {1b}]
+
+        expect error on n equal to zero
+            .[.dataprofile.peek; ("/tmp/dp_quke.csv"; ","; 0); {1b}]
+
+        expect error on negative n
+            .[.dataprofile.peek; ("/tmp/dp_quke.csv"; ","; -1); {1b}]
+
+        expect error on non-existent file
+            .[.dataprofile.peek; ("/tmp/dp_quke_NOTFOUND_xyz987.csv"; ","; 5); {1b}]
+
+// =============================================================================
+// .dataprofile.inferSchema
+// =============================================================================
+
+feature .dataprofile.inferSchema
+
+    before
+        if[not `dataprofile in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/dataprofile/dataprofile.q"; "/app/q-modules/dataprofile/dataprofile.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/dataprofile/dataprofile.q"]
+        ]
+
+    should infer correct type chars for well-typed columns
+
+        expect date column inferred as d
+            "d" ~ .dataprofile.inferSchema[([] d: enlist "2024.01.01"); 100][`d]
+
+        expect float column inferred as f
+            "f" ~ .dataprofile.inferSchema[([] p: ("100.5";"200.0";"50.75")); 100][`p]
+
+        expect integer column inferred as j
+            "j" ~ .dataprofile.inferSchema[([] n: ("100";"200";"300")); 100][`n]
+
+        expect low-cardinality string column promoted to symbol star
+            "*" ~ .dataprofile.inferSchema[([] s: ("AAPL";"GOOG";"AAPL";"GOOG")); 100][`s]
+
+        expect high-cardinality string column stays as varchar space
+            " " ~ .dataprofile.inferSchema[([] s: ("AAPL";"GOOG";"MSFT";"AMZN")); 1][`s]
+
+    should return a dictionary keyed by column symbols
+
+        expect result is a dictionary (type 99h)
+            99h = type .dataprofile.inferSchema[([] a: enlist "1"; b: enlist "x"); 100]
+
+        expect result contains all column names as keys
+            `a`b ~ key .dataprofile.inferSchema[([] a: enlist "1"; b: enlist "x"); 100]
+
+    should infer varchar for blank or all-null columns
+
+        expect blank column maps to space (varchar)
+            " " ~ .dataprofile.inferSchema[([] e: ("";"";""; "")); 100][`e]
+
+    should signal on non-table input
+
+        expect error when passed a list
+            .[.dataprofile.inferSchema; (1 2 3; 100); {1b}]
+
+        expect error when passed a symbol
+            .[.dataprofile.inferSchema; (`notatable; 100); {1b}]
+
+// =============================================================================
+// .dataprofile.cast
+//
+// NOTE: cast requires 2 args (tbl; typeMap). Qcumber splits on `;` in expect
+// expressions, so cast results are pre-computed via setup_code globals.
+// Single-entry type maps use enlist[`col]!enlist "c" (NOT `col!"c" -> 'type).
+// =============================================================================
+
+feature .dataprofile.cast
+
+    before
+        if[not `dataprofile in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/dataprofile/dataprofile.q"; "/app/q-modules/dataprofile/dataprofile.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/dataprofile/dataprofile.q"]
+        ]
+
+    should cast float column from string to float
+
+        expect price column has float type after cast
+            all -9h = type each dp_castPrice`price
+
+    should cast integer column from string to long
+
+        expect size column first value is 100
+            100 ~ first dp_castInt`size
+
+    should cast symbol column from string using star type
+
+        expect sym column has symbol type after cast
+            11h = type dp_castSym`sym
+
+    should leave varchar columns unchanged
+
+        expect varchar column is unchanged (type 0h general list)
+            0h = type dp_castVar`note
+
+    should cast date column from string to date
+
+        expect date column has date type after cast
+            14h = type dp_castDate`d
+
+    should signal on non-table input
+
+        expect error when tbl is not a table
+            .[.dataprofile.cast; (42; ()!()); {1b}]
+
+// =============================================================================
+// .dataprofile.profile
+// =============================================================================
+
+feature .dataprofile.profile
+
+    before
+        if[not `dataprofile in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/dataprofile/dataprofile.q"; "/app/q-modules/dataprofile/dataprofile.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/dataprofile/dataprofile.q"]
+        ]
+
+    should return a table with one row per column
+
+        expect result is a table (type 98h)
+            98h = type .dataprofile.profile[([] a: ("AAPL";"GOOG";"MSFT")); 10]
+
+        expect row count equals number of input columns
+            1 = count .dataprofile.profile[([] a: ("AAPL";"GOOG";"MSFT")); 10]
+
+    should contain all required columns in result
+
+        expect col column present in result
+            `col in cols .dataprofile.profile[([] a: enlist "1"); 10]
+
+        expect type column present in result
+            `type in cols .dataprofile.profile[([] a: enlist "1"); 10]
+
+        expect nullCount column present in result
+            `nullCount in cols .dataprofile.profile[([] a: enlist "1"); 10]
+
+        expect fillPct column present in result
+            `fillPct in cols .dataprofile.profile[([] a: enlist "1"); 10]
+
+        expect distinctCount column present in result
+            `distinctCount in cols .dataprofile.profile[([] a: enlist "1"); 10]
+
+    should compute statistics correctly
+
+        expect total row count is tallied
+            3 = first .dataprofile.profile[([] a: ("AAPL";"GOOG";"MSFT")); 10][`total]
+
+        expect null count detected for empty strings
+            1 = first .dataprofile.profile[([] a: ("AAPL";"";"MSFT")); 10][`nullCount]
+
+        expect fillPct is 1.0 when no nulls present
+            1e-6 > abs 1.0 - first .dataprofile.profile[([] a: ("AAPL";"GOOG";"MSFT")); 10][`fillPct]
+
+        expect fillPct is 0.0 when all values null
+            1e-6 > abs 0.0 - first .dataprofile.profile[([] a: ("";"";"")); 10][`fillPct]
+
+        expect distinctCount is number of unique non-null values
+            2 = first .dataprofile.profile[([] a: ("AAPL";"GOOG";"AAPL")); 10][`distinctCount]
+
+    should signal on non-table input
+
+        expect error when passed a list
+            .[.dataprofile.profile; (1 2 3; 10); {1b}]
+
+// =============================================================================
+// .dataprofile.proposeSchema
+// =============================================================================
+
+feature .dataprofile.proposeSchema
+
+    before
+        if[not `dataprofile in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/dataprofile/dataprofile.q"; "/app/q-modules/dataprofile/dataprofile.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/dataprofile/dataprofile.q"]
+        ]
+        `:/tmp/dp_quke_ps.csv 0: ("date,sym,price,size,exchange";
+                                   "2024.01.01,AAPL,100.5,1000,NYSE";
+                                   "2024.01.02,GOOG,200.0,500,NASDAQ";
+                                   "2024.01.03,MSFT,50.25,2000,NYSE";
+                                   "2024.01.04,AMZN,300.0,750,NASDAQ";
+                                   "2024.01.05,TSLA,180.0,1200,NYSE")
+
+    should return a dictionary with all expected keys
+
+        expect result is a dictionary
+            99h = type .dataprofile.proposeSchema["/tmp/dp_quke_ps.csv"; ","; 100; "trades"; 10]
+
+        expect tableName key present
+            `tableName in key .dataprofile.proposeSchema["/tmp/dp_quke_ps.csv"; ","; 100; "trades"; 10]
+
+        expect typeStr key present
+            `typeStr in key .dataprofile.proposeSchema["/tmp/dp_quke_ps.csv"; ","; 100; "trades"; 10]
+
+        expect loadExpr key present
+            `loadExpr in key .dataprofile.proposeSchema["/tmp/dp_quke_ps.csv"; ","; 100; "trades"; 10]
+
+        expect profile key present
+            `profile in key .dataprofile.proposeSchema["/tmp/dp_quke_ps.csv"; ","; 100; "trades"; 10]
+
+        expect typeMap key present
+            `typeMap in key .dataprofile.proposeSchema["/tmp/dp_quke_ps.csv"; ","; 100; "trades"; 10]
+
+    should infer correct type string for trades CSV
+
+        expect typeStr is d star f j star (date sym price size exchange)
+            "d*fj*" ~ .dataprofile.proposeSchema["/tmp/dp_quke_ps.csv"; ","; 100; "trades"; 10][`typeStr]
+
+    should compute correct column and row counts
+
+        expect colCount is 5
+            5 = .dataprofile.proposeSchema["/tmp/dp_quke_ps.csv"; ","; 100; "trades"; 10][`colCount]
+
+        expect rowsSampled equals actual data row count
+            5 = .dataprofile.proposeSchema["/tmp/dp_quke_ps.csv"; ","; 100; "trades"; 10][`rowsSampled]
+
+    should build a valid load expression
+
+        expect loadExpr starts with tbl colon
+            "tbl:" ~ 4 sublist .dataprofile.proposeSchema["/tmp/dp_quke_ps.csv"; ","; 100; "trades"; 10][`loadExpr]
+
+        expect loadExpr is longer than CSV path (non-trivial expression)
+            30 < count .dataprofile.proposeSchema["/tmp/dp_quke_ps.csv"; ","; 100; "trades"; 10][`loadExpr]
+
+        expect loadExpr contains 0 colon load operator
+            1 <= count ss[.dataprofile.proposeSchema["/tmp/dp_quke_ps.csv"; ","; 100; "trades"; 10][`loadExpr]; "0:"]
+
+    should signal on non-existent file
+
+        expect error when file not found
+            .[.dataprofile.proposeSchema; ("/tmp/dp_quke_NOTFOUND_xyz987.csv"; ","; 100; "t"; 10); {1b}]
+
+// =============================================================================
+// .dataprofile.suggestIngestion
+//
+// NOTE: proposal dicts are pre-computed via setup_code globals (dp_propDate,
+// dp_propTs, dp_propStrOnly) to avoid qcumber's multi-line expression
+// limitations and the reserved-word `type` in inline table constructors.
+// =============================================================================
+
+feature .dataprofile.suggestIngestion
+
+    before
+        if[not `dataprofile in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/dataprofile/dataprofile.q"; "/app/q-modules/dataprofile/dataprofile.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/dataprofile/dataprofile.q"]
+        ]
+
+    should return a dict with all expected keys given a date-partitioned schema
+
+        expect result type is dictionary
+            99h = type .dataprofile.suggestIngestion[dp_propDate]
+
+        expect tableName key in result
+            `tableName in key .dataprofile.suggestIngestion[dp_propDate]
+
+        expect storageMode key in result
+            `storageMode in key .dataprofile.suggestIngestion[dp_propDate]
+
+        expect partitionCol key in result
+            `partitionCol in key .dataprofile.suggestIngestion[dp_propDate]
+
+        expect ingestCode key in result
+            `ingestCode in key .dataprofile.suggestIngestion[dp_propDate]
+
+    should identify date column as partition key
+
+        expect partitionCol is date when typeMap contains date column
+            `date ~ .dataprofile.suggestIngestion[dp_propDate][`partitionCol]
+
+    should prefer timestamp column over date column for partitioning
+
+        expect partitionCol is ts when both ts and date columns present
+            `ts ~ .dataprofile.suggestIngestion[dp_propTs][`partitionCol]
+
+    should set storageMode to in-memory when no date or timestamp column
+
+        expect storageMode is in-memory for string-only table
+            "in-memory" ~ .dataprofile.suggestIngestion[dp_propStrOnly][`storageMode]
+
+    should set null symbol as partitionCol when no temporal column
+
+        expect partitionCol is backtick null for non-temporal table
+            `~ .dataprofile.suggestIngestion[dp_propStrOnly][`partitionCol]
+
+    should set storageMode to partitioned HDB for date column
+
+        expect storageMode is partitioned HDB (date col) for date table
+            "partitioned HDB (date col)" ~ .dataprofile.suggestIngestion[dp_propDate][`storageMode]
+
+    should estimate positive rowBytes
+
+        expect rowBytes is a positive integer for any schema
+            0 < .dataprofile.suggestIngestion[dp_propDate][`rowBytes]
+
+    should produce non-empty ingestCode string
+
+        expect ingestCode is a non-empty string
+            0 < count .dataprofile.suggestIngestion[dp_propDate][`ingestCode]
+
+// =============================================================================
+// .dataprofile.bytesForType_ (internal helper — tested via public contract)
+// =============================================================================
+
+feature .dataprofile internal bytesForType_ helper
+
+    before
+        if[not `dataprofile in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/dataprofile/dataprofile.q"; "/app/q-modules/dataprofile/dataprofile.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/dataprofile/dataprofile.q"]
+        ]
+
+    should return known byte sizes for standard type chars
+
+        expect long (j) is 8 bytes
+            8i = .dataprofile.bytesForType_["j"]
+
+        expect float (f) is 8 bytes
+            8i = .dataprofile.bytesForType_["f"]
+
+        expect date (d) is 4 bytes
+            4i = .dataprofile.bytesForType_["d"]
+
+        expect short (h) is 2 bytes
+            2i = .dataprofile.bytesForType_["h"]
+
+        expect char (c) is 1 byte
+            1i = .dataprofile.bytesForType_["c"]
+
+        expect boolean (b) is 1 byte
+            1i = .dataprofile.bytesForType_["b"]
+
+    should return default size for unknown type chars
+
+        expect unknown type char returns 16 bytes
+            16i = .dataprofile.bytesForType_["?"]

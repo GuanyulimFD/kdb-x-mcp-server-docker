@@ -210,8 +210,10 @@ app_settings = AppSettings()
 def main():
     """Main entry point for the KDB-X MCP Server."""
 
-    # Setup logging with configured level
-    setup_logging(app_settings.mcp.log_level)
+    # Setup logging — if KDBX_MCP_LOG_FILE (or --mcp.log-file) is set the
+    # Python server will append to that same file, giving a single unified
+    # log alongside the KDB-X q-process output (see scripts/start_all.sh).
+    setup_logging(app_settings.mcp.log_level, log_file=app_settings.mcp.log_file)
 
     server = McpServer(app_settings)
     server.run()
