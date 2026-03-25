@@ -25,7 +25,13 @@ cd kdb-x-mcp-server
 
 # 2. Fill in credentials
 cp .env.example .env
-# Edit .env - set KX_BEARER_TOKEN (obtained from trying to download kdb x) and KX_B64LIC (can also be obtained from trying to download kdb x)
+# Edit .env - set KX_BEARER_TOKEN and KX_B64LIC
+# (Both values come from the KX developer portal installer command)
+
+# IMPORTANT: KX_BEARER_TOKEN is consumed as a BuildKit secret from the HOST SHELL
+# environment. Docker Compose does NOT promote .env values into the shell, so you
+# must export it explicitly before running docker compose build:
+export KX_BEARER_TOKEN="<your-bearer-token>"
 
 # The ax-libraries.zip is read directly from developer-1.5.4-osx/ (already in repo)
 # No extra copy step needed - it is whitelisted in .dockerignore
@@ -75,6 +81,12 @@ bash install_kdb.sh --b64lic <THIS_IS_YOUR_LICENSE>
 > **Security**: `KX_BEARER_TOKEN` is passed as a **BuildKit secret** and is
 > never written to any image layer or visible in `docker history`.
 > `KX_B64LIC` ends up in the license file inside the image, which is expected.
+>
+> **Important**: Docker Compose resolves `secrets.kx_bearer.environment` from the
+> **host shell environment**, not from `.env`. Always `export KX_BEARER_TOKEN=<token>`
+> in your shell before running `docker compose build`. Failure to do so causes `curl`
+> to receive an empty bearer token, which the KX portal rejects with HTTP 401/403
+> (exit code 22).
 
 ---
 
@@ -175,7 +187,7 @@ docker compose down
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
 | `ERROR: --build-arg KX_B64LIC is required` | Missing `.env` entry | Add `KX_B64LIC=...` to `.env` |
-| `Error: secret not found: kx_bearer` | `KX_BEARER_TOKEN` not exported | Ensure it is in `.env` (exported by docker compose) |
+| `Error: secret not found: kx_bearer` | `KX_BEARER_TOKEN` not in shell env | Run `export KX_BEARER_TOKEN=<token>` before `docker compose build` — putting it only in `.env` is not sufficient; BuildKit secrets require an exported shell variable |
 | `COPY failed: developer-1.5.4-osx/ax-libraries.zip not found` | Zip missing from repo | Confirm `developer-1.5.4-osx/ax-libraries.zip` exists at repo root |
 | `ERROR: qcumber.q_ not found` | ax-libraries zip corrupt or wrong layout | Inspect `docker build` output; verify zip with `unzip -l developer-1.5.4-osx/ax-libraries.zip` |
 | `q binary not found` in startup banner | Build succeeded but PATH issue | Should not happen; file a bug |

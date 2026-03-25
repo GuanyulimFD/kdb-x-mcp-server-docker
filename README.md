@@ -89,6 +89,10 @@ cd kdb-x-mcp-server-docker
 cp .env.example .env
 # Edit .env — fill in KX_BEARER_TOKEN and KX_B64LIC
 
+# IMPORTANT: KX_BEARER_TOKEN is passed as a BuildKit secret from the HOST SHELL
+# environment — putting it only in .env is not enough. Export it explicitly:
+export KX_BEARER_TOKEN="<your-bearer-token>"
+
 # 3. Build (installs KDB-X + ax-libraries inside the image)
 docker compose build
 
