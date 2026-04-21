@@ -7,6 +7,10 @@ __pycache__*
 coverage.xml
 report.xml
 out
+copilot_exports
+.vscode/settings.json
+.specstory
+.pytest_cache/
 # KDB-X service logs (timestamped, generated at runtime)
 logs/*.log
 logs/kdbx.pid
@@ -17,3 +21,6 @@ vendor/ax-libraries/
 vendor/ax-libraries.zip
 .DS_Store
 .github/kdb-knowhow.md
+
+# Local JIRA / task memory — agent handover files, not for version control
+.memory/
