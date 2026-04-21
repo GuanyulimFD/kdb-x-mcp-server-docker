@@ -49,3 +49,4 @@ bash scripts/test_q_analytics.sh
 | `finstat` | `.finstat` | Common financial statistics: VWAP, returns, volatility, SMA/EMA, Sharpe, max drawdown |
 | `dataprofile` | `.dataprofile` | CSV/data-file profiling: peek, type inference, schema proposal, ingestion recommendations |
 | `cron` | `.cron` | Timer-driven cron job scheduler: register jobs with time windows, periods, and args; driven by `.z.ts` |
+| `tca` | `.tca` | T+1 TCA at equity parent order level: fill rate, trader hold time, exec hold time (GEP-1123) |

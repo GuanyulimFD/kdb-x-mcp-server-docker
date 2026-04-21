@@ -58,6 +58,13 @@ Python MCP wrapper. The two primary AI-facing tools — `kdbx_q_eval` and
 
 ### KDB-X service management
 
+> **RULE — HIGHEST PRIORITY**: If MCP tools (`kdbx_q_eval`, `kdbx_q_unit_test`, etc.) are available
+> and responding, **NEVER start or stop a KDB-X instance under any circumstances**. Use the MCP tools
+> directly. The MCP server manages its own KDB-X connection; agents must not interfere with it.
+>
+> Only use the start/stop scripts below when explicitly instructed by the user AND the MCP tools
+> are confirmed unavailable.
+
 > **RULE**: Agents must **never** attempt to start or stop the KDB-X service by
 > constructing their own shell commands. Always use the provided scripts — they
 > handle binary discovery, PID tracking, port conflict detection, logging, and
@@ -65,8 +72,8 @@ Python MCP wrapper. The two primary AI-facing tools — `kdbx_q_eval` and
 
 | Task | Command |
 |------|---------|
-| Start KDB-X on a port | `./scripts/start_kdbx.sh <port>` |
-| Stop KDB-X (by PID file + port) | `./scripts/stop_kdbx.sh <port>` |
+| Start KDB-X on a port | `./scripts/start_kdbx.sh <port>` — **only when MCP tools are unavailable AND user explicitly asks** |
+| Stop KDB-X (by PID file + port) | `./scripts/stop_kdbx.sh <port>` — **only when MCP tools are unavailable AND user explicitly asks** |
 | Check if KDB-X is listening | `lsof -iTCP:<port> -sTCP:LISTEN` |
 | Tail the live log | `tail -f logs/kdbx_<timestamp>.log` |
 
@@ -683,7 +690,36 @@ Create a topic-specific instruction file alongside this one and link to it here:
 |-------------------|---------|
 | _(add when needed)_ | e.g. `.github/instructions/embeddings.instructions.md` |
 | _(add when needed)_ | e.g. `.github/instructions/sql-tools.instructions.md` |
+---
 
+## 8.7 Agent Skills
+
+Three agent skills are available in `.github/skills/`. Each is loaded **on demand** when the matching use case arises.
+
+| Skill | Folder | Trigger / Use Case |
+|-------|--------|-------------------|
+| **KDB Business Analyst** | `.github/skills/kdb-business-analyst/` | Gathering business requirements; writing BDD specifications; creating or reviewing JIRA tickets for trade P&L, client profile, or trading behaviour features. **Never infers — always asks.** |
+| **KDB Developer** | `.github/skills/kdb-developer/` | Implementing q modules; testing q syntax via `kdbx_q_eval`; writing qcumber test suites from BDD specs in a separate session. |
+| **KDB Doc & Review** | `.github/skills/kdb-doc-review/` | Reviewing documentation completeness; auditing knowledge drift across BDD spec / module / quke tests / README; expert KDB code review; drafting Confluence pages. |
+
+### Skill Workflow (summary)
+
+```
+Business Analyst skill
+  └─ Elicits requirements → writes BDD spec + JIRA ticket
+        │
+        ▼
+     KDB Developer skill
+       ├─ Phase 1–4: implements module using kdbx_q_eval (tests every expression live)
+       └─ Phase 5:   NEW session → writes .quke tests from BDD spec only
+              │
+              ▼
+           KDB Doc & Review skill
+             ├─ Documentation completeness audit
+             ├─ Knowledge drift check (BDD ↔ module ↔ quke ↔ README)
+             ├─ Expert code review (naming, idioms, performance, logging)
+             └─ Confluence page draft
+```
 Topic files should use VS Code's
 [scoped instructions](https://code.visualstudio.com/docs/copilot/copilot-customization#_instruction-files)
 (`applyTo` glob) to activate only for relevant files.
@@ -700,14 +736,18 @@ Topic files should use VS Code's
 | New KDB-X module | Follow <https://code.kx.com/kdb-x/modules/module-framework/quickstart.html> |
 | New reusable q module | Create `q-modules/<name>/<name>.q` + `<name>.quke`; see §8 |
 | Available q modules | See `q-modules/README.md` for the full catalogue |
+| Gather business requirements / write BDD | Use the `kdb-business-analyst` skill |
+| JIRA memory file (handover record) | BA skill auto-creates `.memory/jira/<TICKET-ID>.md`; see template at `.memory/template/JIRA-TEMPLATE.md` |
+| Implement a new q module | Use the `kdb-developer` skill |
+| Review docs / code quality / knowledge drift | Use the `kdb-doc-review` skill |
 | qcumber test reference | <https://code.kx.com/developer/qcumber/> |
 | New MCP tool | Create `src/mcp_server/tools/kdbx_<name>.py`, register in `__init__.py` |
 | Prototype q logic | Call `kdbx_q_eval` tool interactively |
 | Test q logic | Call `kdbx_q_unit_test` tool with `.quke` content |
 | New pytest file | Mirror path under `tests/`, add `live_kdb` marker for integration tests |
 | Profile q code | Use `\t`, `\ts`, `\ts:n` commands inside `kdbx_q_eval` |
-| **Start KDB-X** | `./scripts/start_kdbx.sh <port>` — always use this script |
-| **Stop KDB-X** | `./scripts/stop_kdbx.sh <port>` — always use this script |
+| **Start KDB-X** | **NEVER start KDB-X if MCP tools are available.** Only use `./scripts/start_kdbx.sh <port>` when MCP tools are unavailable AND user explicitly requests it |
+| **Stop KDB-X** | **NEVER stop KDB-X if MCP tools are available.** Only use `./scripts/stop_kdbx.sh <port>` when MCP tools are unavailable AND user explicitly requests it |
 | Check KDB-X is up | `lsof -iTCP:<port> -sTCP:LISTEN` |
 | Run MCP server locally | `uv run mcp-server --db.port <port>` |
 | Run Python unit tests | `uv run pytest tests/ -m "not live_kdb" -v` |
