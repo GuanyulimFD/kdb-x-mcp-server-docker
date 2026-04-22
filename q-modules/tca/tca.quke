@@ -1,0 +1,377 @@
+// =============================================================================
+// Unit tests for the .tca module
+// File   : q-modules/tca/tca.quke
+// BDD    : GEP-1123 -- T+1 TCA fill rate and hold time analytics
+// Runner : qcumber (run via kdbx_q_unit_test MCP tool)
+// Author : KDB Developer skill (2026-04-21)
+//
+// Coverage map (BDD scenario -> feature / should):
+//   BDD S1  -> fillRate computation / fully filled returns 1.0
+//   BDD S2  -> timing metrics / traderHoldTimeSecs = 300s
+//   BDD S3  -> timing metrics / execHoldTimeSecs = 165s (last fill)
+//   BDD S4  -> output schema / table type + row count + column names
+//   BDD S5  -> fillRate computation / partial fill returns 0.4
+//   BDD S6  -> null propagation / cancelled parent -- all nulls
+//   BDD S7  -> single child slice / all metrics non-null + correct values
+//   BDD S8  -> null propagation / null parentOrderTime
+//   BDD S9  -> equity filter / non-equity excluded
+//   BDD S10 -> error path / no data for date signals descriptive error
+//
+// AC coverage:
+//   AC1  -> output schema / table type + row count
+//   AC2  -> fillRate computation / fully filled + partial
+//   AC3  -> fillRate computation / cancelled zero-fill + no children
+//   AC4  -> timing metrics / traderHoldTimeSecs = 300s
+//   AC5  -> timing metrics / execHoldTimeSecs uses last fill
+//   AC6  -> null propagation / null parentOrderTime + no children
+//   AC7  -> null propagation / no fills yields null execHoldTimeSecs
+//   AC8  -> equity filter / FX and futures excluded
+//   AC9  -> error path / no data for date signals error
+//   AC10 -> output schema / exact 6-column schema with correct types
+//
+// Design notes:
+//   - All features call .tca.calcWith_ directly (avoids live HDB dependency)
+//   - Each feature defines its own mock tables via :: globals in before block
+//   - Unique variable name prefixes per feature avoid cross-feature pollution
+//   - 0Np cannot appear inline in a timestamp list literal -- use two-step:
+//       (1) build table with a placeholder timestamp
+//       (2) update col:0Np from t where orderId=`target
+//   - Float comparison: 1e-6 > abs expected - actual
+//   - Substring match: use (string) like "*pattern*" not (string) in (string)
+//   - Error trapping: .[fn; argList; {1b}] and .[fn; argList; {x}]
+//   - Portable module path: Docker /app/ with macOS getenv[`HOME] fallback
+// =============================================================================
+
+feature tca module loads correctly
+
+    before
+        if[not `tca in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/tca/tca.q"; "/app/q-modules/tca/tca.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/tca/tca.q"]
+        ]
+
+    should expose public and private API in .tca namespace
+
+        expect calcWith_ exists
+            `calcWith_ in key `.tca
+
+        expect calcDaily exists
+            `calcDaily in key `.tca
+
+        expect require_ guard exists
+            `require_ in key `.tca
+
+        expect logI_ helper exists
+            `logI_ in key `.tca
+
+feature .tca.calcWith_ fillRate computation -- AC2 AC3 BDD-S1 BDD-S5 BDD-S6
+
+    before
+        if[not `tca in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/tca/tca.q"; "/app/q-modules/tca/tca.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/tca/tca.q"]
+        ];
+        d_fr:: 2026.04.18;
+        iTbl_fr:: ([] sym:`MSFT`AAPL; assetClass:`equity`equity);
+        oTbl_fr:: ([]
+            date:          2026.04.18 2026.04.18 2026.04.18 2026.04.18 2026.04.18 2026.04.18 2026.04.18 2026.04.18;
+            sym:           `MSFT`MSFT`MSFT`AAPL`AAPL`MSFT`MSFT`MSFT;
+            orderId:       `PO001`CO001a`CO001b`PO002`CO002a`PO003`PO004`CO004a;
+            parentOrderId: `PO001`PO001`PO001`PO002`PO002`PO003`PO004`PO004;
+            time:          2026.04.18D09:00:00.000000000 2026.04.18D09:05:00.000000000 2026.04.18D09:05:30.000000000 2026.04.18D10:00:00.000000000 2026.04.18D10:02:00.000000000 2026.04.18D11:00:00.000000000 2026.04.18D11:30:00.000000000 2026.04.18D11:32:00.000000000;
+            qty:           1000 500 500 1000 500 200 200 200;
+            fillQty:       0N 500 500 0N 400 0N 0N 0;
+            status:        `open`filled`filled`partial`partial`cancelled`open`cancelled);
+        tTbl_fr:: ([]
+            date:    2026.04.18 2026.04.18 2026.04.18 2026.04.18 2026.04.18;
+            sym:     `MSFT`MSFT`MSFT`AAPL`AAPL;
+            orderId: `CO001a`CO001b`CO001b`CO002a`CO002a;
+            time:    2026.04.18D09:05:30.000000000 2026.04.18D09:06:00.000000000 2026.04.18D09:07:45.000000000 2026.04.18D10:05:00.000000000 2026.04.18D10:07:00.000000000;
+            size:    500 250 250 200 200);
+        res_fr:: .tca.calcWith_[oTbl_fr; tTbl_fr; iTbl_fr; d_fr]
+
+    should return 1.0 for fully filled equity parent order -- BDD-S1 AC2
+
+        expect fillRate for PO001 is 1.0
+            r: select from res_fr where parentOrderId=`PO001;
+            1e-6 > abs 1.0 - first r`fillRate
+
+    should return 0.4 for partially filled equity parent order -- BDD-S5 AC2
+
+        expect fillRate for PO002 is 0.4
+            r: select from res_fr where parentOrderId=`PO002;
+            1e-6 > abs 0.4 - first r`fillRate
+
+    should return null fillRate for parent with no child orders -- AC3
+
+        expect fillRate for PO003 is null (no children)
+            r: select from res_fr where parentOrderId=`PO003;
+            null first r`fillRate
+
+    should return null fillRate for parent where child fillQty sums to zero -- AC3
+
+        expect fillRate for PO004 is null (child fillQty is 0)
+            r: select from res_fr where parentOrderId=`PO004;
+            null first r`fillRate
+
+feature .tca.calcWith_ timing metrics -- AC4 AC5 BDD-S2 BDD-S3
+
+    before
+        if[not `tca in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/tca/tca.q"; "/app/q-modules/tca/tca.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/tca/tca.q"]
+        ];
+        d_tm:: 2026.04.18;
+        iTbl_tm:: ([] sym:enlist `MSFT; assetClass:enlist `equity);
+        oTbl_tm:: ([]
+            date:          3#2026.04.18;
+            sym:           3#`MSFT;
+            orderId:       `PO001`CO001a`CO001b;
+            parentOrderId: `PO001`PO001`PO001;
+            time:          2026.04.18D09:00:00.000000000 2026.04.18D09:05:00.000000000 2026.04.18D09:05:30.000000000;
+            qty:           1000 500 500;
+            fillQty:       0N 500 500;
+            status:        `open`filled`filled);
+        tTbl_tm:: ([]
+            date:    3#2026.04.18;
+            sym:     3#`MSFT;
+            orderId: `CO001a`CO001b`CO001b;
+            time:    2026.04.18D09:05:30.000000000 2026.04.18D09:06:00.000000000 2026.04.18D09:07:45.000000000;
+            size:    500 250 250);
+        res_tm:: .tca.calcWith_[oTbl_tm; tTbl_tm; iTbl_tm; d_tm]
+
+    should compute traderHoldTimeSecs as 300s from 09:00 to 09:05 -- BDD-S2 AC4
+
+        expect traderHoldTimeSecs for PO001 is 300.0 seconds
+            r: select from res_tm where parentOrderId=`PO001;
+            1e-6 > abs 300.0 - first r`traderHoldTimeSecs
+
+    should use last fill for execHoldTimeSecs -- 165s from 09:05:00 to 09:07:45 -- BDD-S3 AC5
+
+        expect execHoldTimeSecs for PO001 is 165.0 seconds (09:07:45 minus 09:05:00)
+            r: select from res_tm where parentOrderId=`PO001;
+            1e-6 > abs 165.0 - first r`execHoldTimeSecs
+
+feature .tca.calcWith_ null propagation -- AC6 AC7 BDD-S6 BDD-S8
+
+    before
+        if[not `tca in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/tca/tca.q"; "/app/q-modules/tca/tca.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/tca/tca.q"]
+        ];
+        d_np:: 2026.04.18;
+        iTbl_np:: ([] sym:`MSFT`AAPL; assetClass:`equity`equity);
+        oTbl_np_base:: ([]
+            date:          2026.04.18 2026.04.18 2026.04.18 2026.04.18 2026.04.18;
+            sym:           `MSFT`MSFT`AAPL`AAPL`AAPL;
+            orderId:       `PCNC1`PO_NT`CO_NT1`PO_NF`CO_NF1;
+            parentOrderId: `PCNC1`PO_NT`PO_NT`PO_NF`PO_NF;
+            time:          2026.04.18D11:00:00.000000000 2026.04.18D08:00:00.000000000 2026.04.18D08:05:00.000000000 2026.04.18D12:00:00.000000000 2026.04.18D12:02:00.000000000;
+            qty:           200 500 500 300 300;
+            fillQty:       0N 0N 300 0N 300;
+            status:        `cancelled`open`partial`open`filled);
+        oTbl_np:: update time:0Np from oTbl_np_base where orderId=`PO_NT;
+        tTbl_np:: ([]
+            date:    1#2026.04.18;
+            sym:     1#`AAPL;
+            orderId: 1#`CO_NT1;
+            time:    1#2026.04.18D08:10:00.000000000;
+            size:    1#300);
+        res_np:: .tca.calcWith_[oTbl_np; tTbl_np; iTbl_np; d_np]
+
+    should return all nulls for cancelled parent with no children -- BDD-S6
+
+        expect fillRate for PCNC1 is null (no children)
+            r: select from res_np where parentOrderId=`PCNC1;
+            null first r`fillRate
+
+        expect traderHoldTimeSecs for PCNC1 is null (no children)
+            r: select from res_np where parentOrderId=`PCNC1;
+            null first r`traderHoldTimeSecs
+
+        expect execHoldTimeSecs for PCNC1 is null (no fills)
+            r: select from res_np where parentOrderId=`PCNC1;
+            null first r`execHoldTimeSecs
+
+    should return null traderHoldTimeSecs when parentOrderTime is null -- BDD-S8 AC6
+
+        expect traderHoldTimeSecs for PO_NT is null (pTime is 0Np)
+            r: select from res_np where parentOrderId=`PO_NT;
+            null first r`traderHoldTimeSecs
+
+    should compute execHoldTimeSecs normally despite null parentOrderTime -- BDD-S8 AC6
+
+        expect execHoldTimeSecs for PO_NT is 300.0s (08:10:00 minus 08:05:00)
+            r: select from res_np where parentOrderId=`PO_NT;
+            1e-6 > abs 300.0 - first r`execHoldTimeSecs
+
+    should return null execHoldTimeSecs when no fills exist in trade table -- AC7
+
+        expect execHoldTimeSecs for PO_NF is null (no fills)
+            r: select from res_np where parentOrderId=`PO_NF;
+            null first r`execHoldTimeSecs
+
+feature .tca.calcWith_ single child order slice -- BDD-S7
+
+    before
+        if[not `tca in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/tca/tca.q"; "/app/q-modules/tca/tca.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/tca/tca.q"]
+        ];
+        d_sc:: 2026.04.18;
+        iTbl_sc:: ([] sym:enlist `MSFT; assetClass:enlist `equity);
+        oTbl_sc:: ([]
+            date:          2#2026.04.18;
+            sym:           2#`MSFT;
+            orderId:       `PO_SC`CO_SC1;
+            parentOrderId: `PO_SC`PO_SC;
+            time:          2026.04.18D09:00:00.000000000 2026.04.18D09:03:00.000000000;
+            qty:           500 500;
+            fillQty:       0N 300;
+            status:        `open`partial);
+        tTbl_sc:: ([]
+            date:    1#2026.04.18;
+            sym:     1#`MSFT;
+            orderId: 1#`CO_SC1;
+            time:    1#2026.04.18D09:08:00.000000000;
+            size:    1#300);
+        res_sc:: .tca.calcWith_[oTbl_sc; tTbl_sc; iTbl_sc; d_sc]
+
+    should return all three metrics as non-null values -- BDD-S7
+
+        expect fillRate is non-null
+            not null first (select from res_sc where parentOrderId=`PO_SC)`fillRate
+
+        expect traderHoldTimeSecs is non-null
+            not null first (select from res_sc where parentOrderId=`PO_SC)`traderHoldTimeSecs
+
+        expect execHoldTimeSecs is non-null
+            not null first (select from res_sc where parentOrderId=`PO_SC)`execHoldTimeSecs
+
+    should compute all three metrics correctly for single child and single fill -- BDD-S7
+
+        expect fillRate is 300 over 500 = 0.6
+            r: select from res_sc where parentOrderId=`PO_SC;
+            1e-6 > abs 0.6 - first r`fillRate
+
+        expect traderHoldTimeSecs is 180.0s (09:03 minus 09:00)
+            r: select from res_sc where parentOrderId=`PO_SC;
+            1e-6 > abs 180.0 - first r`traderHoldTimeSecs
+
+        expect execHoldTimeSecs is 300.0s -- single fill equals last fill (09:08 minus 09:03)
+            r: select from res_sc where parentOrderId=`PO_SC;
+            1e-6 > abs 300.0 - first r`execHoldTimeSecs
+
+feature .tca.calcWith_ equity filter -- AC8 BDD-S9
+
+    before
+        if[not `tca in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/tca/tca.q"; "/app/q-modules/tca/tca.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/tca/tca.q"]
+        ];
+        d_ef:: 2026.04.18;
+        iTbl_ef:: ([] sym:`MSFT`EURUSD`ESH26; assetClass:`equity`fx`futures);
+        oTbl_ef:: ([]
+            date:          2026.04.18 2026.04.18 2026.04.18 2026.04.18 2026.04.18 2026.04.18;
+            sym:           `MSFT`MSFT`EURUSD`EURUSD`ESH26`ESH26;
+            orderId:       `EQP01`EQC01`FXP01`FXC01`FTP01`FTC01;
+            parentOrderId: `EQP01`EQP01`FXP01`FXP01`FTP01`FTP01;
+            time:          2026.04.18D09:00:00.000000000 2026.04.18D09:02:00.000000000 2026.04.18D09:00:00.000000000 2026.04.18D09:02:00.000000000 2026.04.18D09:00:00.000000000 2026.04.18D09:02:00.000000000;
+            qty:           500 500 1000000 1000000 50 50;
+            fillQty:       0N 400 0N 900000 0N 45;
+            status:        `open`partial`open`partial`open`partial);
+        tTbl_ef:: ([]
+            date:    3#2026.04.18;
+            sym:     `MSFT`EURUSD`ESH26;
+            orderId: `EQC01`FXC01`FTC01;
+            time:    3#2026.04.18D09:05:00.000000000;
+            size:    400 900000 45);
+        res_ef:: .tca.calcWith_[oTbl_ef; tTbl_ef; iTbl_ef; d_ef]
+
+    should include only equity parent orders in result -- BDD-S9 AC8
+
+        expect result has exactly one row (only MSFT equity parent)
+            1 = count res_ef
+
+        expect equity parent EQP01 is present in result
+            `EQP01 in res_ef`parentOrderId
+
+        expect FX parent FXP01 is absent from result
+            not `FXP01 in res_ef`parentOrderId
+
+        expect futures parent FTP01 is absent from result
+            not `FTP01 in res_ef`parentOrderId
+
+feature .tca.calcWith_ output schema -- AC10 BDD-S4
+
+    before
+        if[not `tca in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/tca/tca.q"; "/app/q-modules/tca/tca.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/tca/tca.q"]
+        ];
+        d_os:: 2026.04.18;
+        iTbl_os:: ([] sym:`MSFT`AAPL; assetClass:`equity`equity);
+        oTbl_os:: ([]
+            date:          2026.04.18 2026.04.18 2026.04.18 2026.04.18 2026.04.18;
+            sym:           `MSFT`MSFT`MSFT`AAPL`AAPL;
+            orderId:       `SP001`SC001`SC002`SP002`SC003;
+            parentOrderId: `SP001`SP001`SP001`SP002`SP002;
+            time:          2026.04.18D09:00:00.000000000 2026.04.18D09:05:00.000000000 2026.04.18D09:05:30.000000000 2026.04.18D10:00:00.000000000 2026.04.18D10:02:00.000000000;
+            qty:           1000 500 500 1000 500;
+            fillQty:       0N 500 500 0N 400;
+            status:        `open`filled`filled`open`partial);
+        tTbl_os:: ([]
+            date:    5#2026.04.18;
+            sym:     `MSFT`MSFT`MSFT`AAPL`AAPL;
+            orderId: `SC001`SC002`SC002`SC003`SC003;
+            time:    2026.04.18D09:05:30.000000000 2026.04.18D09:06:00.000000000 2026.04.18D09:07:45.000000000 2026.04.18D10:05:00.000000000 2026.04.18D10:07:00.000000000;
+            size:    500 250 250 200 200);
+        res_os:: .tca.calcWith_[oTbl_os; tTbl_os; iTbl_os; d_os]
+
+    should return a table -- BDD-S4 AC1
+
+        expect result type is table (98h)
+            98h = type res_os
+
+    should return one row per equity parent order -- BDD-S4 AC1
+
+        expect result has two rows (SP001 and SP002)
+            2 = count res_os
+
+    should have the six AC10 columns in the correct order -- AC10
+
+        expect columns are date sym parentOrderId fillRate traderHoldTimeSecs execHoldTimeSecs
+            `date`sym`parentOrderId`fillRate`traderHoldTimeSecs`execHoldTimeSecs ~ cols res_os
+
+    should use correct column types -- AC10
+
+        expect date column is date type (-14h)
+            -14h = type first res_os`date
+
+        expect sym column is symbol type (-11h)
+            -11h = type first res_os`sym
+
+        expect parentOrderId column is symbol type (-11h)
+            -11h = type first res_os`parentOrderId
+
+        expect fillRate column is float list (9h)
+            9h = type res_os`fillRate
+
+        expect traderHoldTimeSecs column is float list (9h)
+            9h = type res_os`traderHoldTimeSecs
+
+        expect execHoldTimeSecs column is float list (9h)
+            9h = type res_os`execHoldTimeSecs
+
+feature .tca.calcWith_ error path -- BDD-S10 AC9
+
+    before
+        if[not `tca in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/tca/tca.q"; "/app/q-modules/tca/tca.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/tca/tca.q"]
+        ];
+        iTbl_ep:: ([] sym:enlist `MSFT; assetClass:enlist `equity);
+        emptyO_ep:: ([] date:`date$(); sym:`symbol$(); orderId:`symbol$(); parentOrderId:`symbol$();
+                        time:`timestamp$(); qty:`long$(); fillQty:`long$(); status:`symbol$());
+        emptyT_ep:: ([] date:`date$(); sym:`symbol$(); orderId:`symbol$(); time:`timestamp$(); size:`long$())
+
+    should signal a descriptive error for a date with no order data -- BDD-S10
+
+        expect error is signalled when no parent order rows exist for the date
+            .[.tca.calcWith_; (emptyO_ep; emptyT_ep; iTbl_ep; 2026.03.01); {1b}]
+
+        expect error message contains "no data for date"
+            errMsg_ep: .[.tca.calcWith_; (emptyO_ep; emptyT_ep; iTbl_ep; 2026.03.01); {x}];
+            errMsg_ep like "*no data for date:*"

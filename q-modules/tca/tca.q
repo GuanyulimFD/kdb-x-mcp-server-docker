@@ -8,7 +8,7 @@
 / Requires:    KDB-X 5.0+; HDB tables: order, trade, instrument
 / Author:      kdb-developer
 / Created:     2026-04-20
-/ Updated:     2026-04-20
+/ Updated:     2026-04-21
 / Jira:        GEP-1123
 // =============================================================================
 
@@ -72,12 +72,14 @@ calcWith_:{[oTbl;tTbl;iTbl;d]
 
     / --- equity symbol list ---
     eqSyms: exec sym from iTbl where assetClass=`equity;
+    if[0 = count eqSyms; logW_ "calcWith_: no equity symbols found in iTbl -- result will be empty"];
 
     / --- parent orders (equity only) for date d ---
     / Rename time->pTime to avoid column-name shadowing in later joins.
     pOrders: select date, sym, parentOrderId:orderId, pTime:time, qty
         from oTbl where date=d, orderId=parentOrderId, sym in eqSyms;
     logI_ "calcWith_: parents found  |  count=", string[count pOrders];
+    if[0 = count pOrders; logW_ "calcWith_: no equity parent orders for date=", string[d]];
 
     / --- child order rows for date d ---
     / Filter: rows whose orderId differs from parentOrderId.
@@ -151,6 +153,8 @@ calcWith_:{[oTbl;tTbl;iTbl;d]
 /           execHoldTimeSecs   {float}   Seconds from first child slice to last fill; 0n if no fills.
 / .
 / @throws  "[tca] no data for date: <d>"  when no parent order rows exist for d.
+/ @throws  '<tablename>  if order, trade, or instrument tables are absent from the
+/           global namespace (HDB not fully loaded before calling this function).
 / .
 / @example
 /   .tca.calcDaily[2026.04.18]
