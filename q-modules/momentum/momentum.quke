@@ -1,0 +1,238 @@
+// =============================================================================
+// Unit tests for the .momentum module
+// File   : q-modules/momentum/momentum.quke
+// Runner : qcumber  (run via kdbx_q_unit_test MCP tool)
+//
+// IMPORTANT - use absolute path in setup_code when calling via MCP tool:
+//   system "l /path/to/kdb-x-mcp-server/q-modules/momentum/momentum.q"
+//
+// Key rules:
+//   - Use .[f;args;handler] for multi-arg error trapping, NOT @[f;args;handler]
+//   - Use inline literals; before each :: assignments are unreliable in qcumber
+//   - Use tolerance-based float comparison: 1e-6 > abs expected - actual
+// =============================================================================
+
+feature momentum module loads correctly
+
+    before
+        if[not `momentum in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/momentum/momentum.q"; "/app/q-modules/momentum/momentum.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/momentum/momentum.q"]
+        ]
+
+    should expose all public API symbols in .momentum namespace
+
+        expect mom exists
+            `mom in key `.momentum
+
+        expect roc exists
+            `roc in key `.momentum
+
+        expect mosc exists
+            `mosc in key `.momentum
+
+feature mom (simple momentum) function
+
+    before
+        if[not `momentum in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/momentum/momentum.q"; "/app/q-modules/momentum/momentum.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/momentum/momentum.q"]
+        ]
+
+    should compute correct momentum for period 1
+
+        expect mom with n=1 calculates price difference
+            result: .momentum.mom[100 102 101 105 103f; 1];
+            expected: (0Nf; 2f; -1f; 4f; -2f);
+            .qu.compare[expected; result]
+
+    should compute correct momentum for period 2
+
+        expect mom with n=2 has 2 nulls then differences
+            result: .momentum.mom[100 102 101 105 103f; 2];
+            expected: (0Nf; 0Nf; 1f; 3f; 2f);
+            .qu.compare[expected; result]
+
+    should compute correct momentum for period 3
+
+        expect mom with n=3 has 3 nulls then differences
+            result: .momentum.mom[100 102 104 106 108 110f; 3];
+            expected: (0Nf; 0Nf; 0Nf; 6f; 6f; 6f);
+            .qu.compare[expected; result]
+
+    should handle single element list
+
+        expect mom on 1-element list returns 1 null
+            result: .momentum.mom[100f; 1];
+            .qu.compare[enlist 0Nf; result]
+
+    should handle edge case where n equals list length
+
+        expect mom where n=count prices gives all nulls except last
+            result: .momentum.mom[100 105 110f; 3];
+            expected: (0n; 0n; 110-100);
+            .qu.compare[expected; result]
+
+    should raise error for empty prices list
+
+        expect error on empty list
+            .[.momentum.mom; (0#0f; 1); {1b}]
+
+    should raise error for n less than 1
+
+        expect error when n=0
+            .[.momentum.mom; (100 101 102f; 0); {1b}]
+
+        expect error when n is negative
+            .[.momentum.mom; (100 101 102f; -1); {1b}]
+
+feature roc (rate of change) function
+
+    before
+        if[not `momentum in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/momentum/momentum.q"; "/app/q-modules/momentum/momentum.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/momentum/momentum.q"]
+        ]
+
+    should compute correct ROC for period 1
+
+        expect roc with n=1 calculates percentage change
+            result: .momentum.roc[100 110 105 115.5f; 1];
+            expected: (0Nf, ((110-100)%100)*100, ((105-110)%110)*100, ((115.5-105)%105)*100);
+            all 1e-6 > abs expected - result
+
+    should compute correct ROC for period 2
+
+        expect roc with n=2 has 2 nulls then percentage changes
+            result: .momentum.roc[100 110 105 115.5f; 2];
+            expected: (0n; 0n; ((105-100)%100)*100; ((115.5-110)%110)*100);
+            all 1e-6 > abs expected - result
+
+    should handle zero price gracefully
+
+        expect roc returns null when denominator is zero
+            result: .momentum.roc[0 100 110f; 1];
+            expected: (0Nf, 0Nf, ((110-100)%100)*100);
+            all (null expected) = null result
+
+    should handle negative price changes
+
+        expect roc correctly shows negative percentage
+            result: .momentum.roc[110 100f; 1];
+            expected: (0Nf, ((100-110)%110)*100);
+            all 1e-6 > abs expected - result
+
+    should handle single element list
+
+        expect roc on 1-element list returns 1 null
+            result: .momentum.roc[100f; 1];
+            .qu.compare[enlist 0Nf; result]
+
+    should raise error for empty prices list
+
+        expect error on empty list
+            .[.momentum.roc; (0#0f; 1); {1b}]
+
+    should raise error for n less than 1
+
+        expect error when n=0
+            .[.momentum.roc; (100 101 102f; 0); {1b}]
+
+feature mosc (momentum oscillator) function
+
+    before
+        if[not `momentum in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/momentum/momentum.q"; "/app/q-modules/momentum/momentum.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/momentum/momentum.q"]
+        ]
+
+    should compute correct oscillator for period 3
+
+        expect mosc with n=3 shows deviation from SMA
+            result: .momentum.mosc[100 102 104 106 108f; 3];
+            / SMA[3] = [0n 0n 102 104 106]
+            / mosc = ((price - sma) / sma) * 100
+            / at idx 2: ((104-102)/102)*100 ~1.96
+            / at idx 3: ((106-104)/104)*100 ~1.92
+            / at idx 4: ((108-106)/106)*100 ~1.89
+            all (null result[0 1]) and (0 < result 2 3 4)
+
+    should handle constant price series
+
+        expect mosc returns zeros when price equals SMA
+            result: .momentum.mosc[100 100 100 100f; 2];
+            / mavg in KDB-X does not produce leading nulls - starts immediately
+            expected: (0f; 0f; 0f; 0f);
+            .qu.compare[expected; result]
+
+    should handle upward trending prices
+
+        expect mosc shows positive values for uptrend
+            result: .momentum.mosc[100 110 120 130f; 2];
+            / All non-null values should be positive (price > SMA in uptrend)
+            all result[1 2 3] > 0
+
+    should handle downward trending prices
+
+        expect mosc shows negative values for downtrend
+            result: .momentum.mosc[130 120 110 100f; 2];
+            / All non-null values should be negative (price < SMA in downtrend)
+            all result[1 2 3] < 0
+
+    should handle single element list
+
+        expect mosc on 1-element with n=1 returns zero
+            result: .momentum.mosc[100f; 1];
+            / SMA[1] of single value equals the value, so deviation is 0
+            .qu.compare[enlist 0f; result]
+
+    should handle window size 1
+
+        expect mosc with n=1 always returns zeros
+            result: .momentum.mosc[100 105 110 95f; 1];
+            / When n=1, mavg returns the original series, so price-sma=0
+            .qu.compare[0 0 0 0f; result]
+
+    should raise error for empty prices list
+
+        expect error on empty list
+            .[.momentum.mosc; (0#0f; 1); {1b}]
+
+    should raise error for n less than 1
+
+        expect error when n=0
+            .[.momentum.mosc; (100 101 102f; 0); {1b}]
+
+feature integration with qSQL queries
+
+    before
+        if[not `momentum in key `.;
+            system "l ", $[count key hsym `$"/app/q-modules/momentum/momentum.q"; "/app/q-modules/momentum/momentum.q"; getenv[`HOME], "/kdb-x-mcp-server/q-modules/momentum/momentum.q"]
+        ];
+        / Create test table with price data for two symbols
+        prices :: ([] sym:`AAPL`AAPL`AAPL`AAPL`AAPL`GOOG`GOOG`GOOG`GOOG`GOOG; 
+                      time:10:00 10:01 10:02 10:03 10:04 10:00 10:01 10:02 10:03 10:04; 
+                      price:100 102 101 105 103 200 210 205 215 220f)
+
+    should work within qSQL select with mom
+
+        expect can add mom column in select grouped by sym
+            result: select time, price, mom:.momentum.mom[price;2] by sym from prices;
+            / Each sym group should have momentum calculated independently  
+            / For keyed table: key result gives keys, value result gives values
+            (2 = count key result) and (`mom in cols value result)
+
+    should work within qSQL update with roc
+
+        expect can update table with roc column
+            updated: update roc:.momentum.roc[price;2] by sym from prices;
+            (`roc in cols updated) and (10 = count updated)
+
+    should work within qSQL select with mosc
+
+        expect can add mosc column in select
+            result: select time, price, mosc:.momentum.mosc[price;3] by sym from prices;
+            (`mosc in cols value result) and (2 = count key result)
+
+    should handle grouped aggregations
+
+        expect momentum functions work with each-right in aggregations
+            / Calculate 2-period momentum for each symbol's price series
+            result: select momentum:.momentum.mom[price;2] by sym from prices;
+            (2 = count result) and all `momentum in cols result
