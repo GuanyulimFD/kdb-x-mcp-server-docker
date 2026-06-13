@@ -1,0 +1,783 @@
+// =============================================================================
+// Unit tests for the .volflow module
+// File   : q-modules/volflow/volflow.quke
+// Jira   : GED-1123
+// Runner : qcumber  (run via kdbx_q_unit_test MCP tool)
+//
+// Derived from BDD specification in .memory/jira/GED-1123.md
+// Tests are written in a SEPARATE session from module development
+// per the kdb-developer skill Phase 4 requirement.
+//
+// *** IMPORTANT — setup_code REQUIRED ***
+// volflow.q requires HDB tables (instrument, trade, quote) to be present at
+// load time. Always supply setup_code when calling via kdbx_q_unit_test:
+//
+//   setup_code:
+//     "instrument:([]sym:`AAPL`MSFT`GBPUSD`SPY;assetClass:`equity`equity`fx`equity); \
+//      trade:([]date:`date$();sym:`symbol$();time:`time$();price:`float$();size:`long$();side:`symbol$()); \
+//      quote:([]sym:`symbol$();date:`date$();time:`time$();bid:`float$();ask:`float$();bsize:`long$();asize:`long$()); \
+//      system \"l /app/q-modules/volflow/volflow.q\""
+//
+// Coverage map (BDD → should block):
+//   AC1  → Feature "processOneBucket_ happy path"
+//   AC2  → Feature "composite score computation"
+//   AC3  → Feature "direction signal thresholds"
+//   AC4  → Feature "streaming update: result row and state population (onUpdate)"
+//   AC5  → Feature "calcDay T+1 batch happy path"                       [IMPL PENDING]
+//   AC6  → Feature "empty bucket returns null scores"
+//          Feature "calcDay: no early-bucket rows"                      [IMPL PENDING]
+//   AC7  → Feature "non-equity symbol rejected"                         [IMPL PENDING]
+//          Feature "calcDay: future date rejected"                      [IMPL PENDING]
+//   AC8  → Feature "processOneBucket_ happy path" (schema)
+//   AC9  → Feature "configuration defaults"
+//          Feature "config reset"
+//          Feature "state management"
+//   AC10 → Feature "large-order flow concentration"
+//
+// NOTES:
+//  * Tests marked [IMPL PENDING] expose known implementation gaps in .volflow.update
+//    and .volflow.calcDay — they are expected to fail until those functions are fixed.
+//  * Use .[f; args; handler] for multi-arg error trapping; @[f; arg; handler] for single-arg.
+//  * Tolerance for float comparison: 1e-4 or better unless stated otherwise.
+//  * Do NOT use `before each` global assignments (unreliable in qcumber).
+//    Use inline literals for all test data.
+//  * `before` blocks here only guard against missing module; they do NOT load it.
+//    Loading is done via setup_code (see above).
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// MODULE LOAD
+// ---------------------------------------------------------------------------
+
+feature volflow module loads correctly
+
+    before
+        if[not `processOneBucket_ in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+
+    should expose all five public API functions
+
+        expect onUpdate exists
+            `onUpdate in key `.volflow
+
+        expect calcDay exists
+            `calcDay in key `.volflow
+
+        expect getState exists
+            `getState in key `.volflow
+
+        expect resetState exists
+            `resetState in key `.volflow
+
+        expect resetAll exists
+            `resetAll in key `.volflow
+
+    should expose cfg.reset as a callable function
+
+        expect cfg.reset is type 100
+            100h = type .volflow.cfg.reset
+
+    should have cfg namespace with all required keys
+
+        expect bullThresh key exists
+            `bullThresh in key `.volflow.cfg
+
+        expect bearThresh key exists
+            `bearThresh in key `.volflow.cfg
+
+        expect bucketMins key exists
+            `bucketMins in key `.volflow.cfg
+
+        expect blockSizeThresh key exists
+            `blockSizeThresh in key `.volflow.cfg
+
+        expect vpinBuckets key exists
+            `vpinBuckets in key `.volflow.cfg
+
+        expect weights key exists
+            `weights in key `.volflow.cfg
+
+
+// ---------------------------------------------------------------------------
+// AC9 — CONFIGURATION DEFAULTS
+// ---------------------------------------------------------------------------
+
+feature volflow configuration defaults
+
+    before
+        if[not `processOneBucket_ in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+        .volflow.cfg.reset[]
+
+    should have bullThresh default of 0.6f
+
+        expect bullThresh is 0.6f
+            0.6f = .volflow.cfg.bullThresh
+
+    should have bearThresh default of 0.4f
+
+        expect bearThresh is 0.4f
+            0.4f = .volflow.cfg.bearThresh
+
+    should have bucketMins default of 30
+
+        expect bucketMins is 30
+            30 = .volflow.cfg.bucketMins
+
+    should have blockSizeThresh default of 10000
+
+        expect blockSizeThresh is 10000
+            10000 = .volflow.cfg.blockSizeThresh
+
+    should have vpinBuckets default of 50
+
+        expect vpinBuckets is 50
+            50 = .volflow.cfg.vpinBuckets
+
+    should have weights as a 6-key symbol-keyed float dict
+
+        expect weights has exactly 6 keys
+            6 = count .volflow.cfg.weights
+
+        expect weights keys are the 6 score columns
+            `ofiScore`vpinScore`flowConcScore`pocScore`aggrRatioScore`volImbalScore ~ key .volflow.cfg.weights
+
+        expect weights sum to 1.0f
+            1e-4 > abs 1f - sum .volflow.cfg.weights
+
+        expect each weight is approximately 1/6
+            all (abs each value .volflow.cfg.weights - 1f%6f) < 1e-4
+
+
+// ---------------------------------------------------------------------------
+// AC9 — CONFIG RESET
+// ---------------------------------------------------------------------------
+
+feature volflow config reset restores defaults
+
+    before
+        if[not `processOneBucket_ in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+
+    should restore bullThresh after override
+
+        expect bullThresh returns to 0.6f after reset
+            .volflow.cfg.bullThresh: 0.75f;
+            .volflow.cfg.reset[];
+            0.6f = .volflow.cfg.bullThresh
+
+    should restore bearThresh after override
+
+        expect bearThresh returns to 0.4f after reset
+            .volflow.cfg.bearThresh: 0.2f;
+            .volflow.cfg.reset[];
+            0.4f = .volflow.cfg.bearThresh
+
+    should restore blockSizeThresh after override
+
+        expect blockSizeThresh returns to 10000 after reset
+            .volflow.cfg.blockSizeThresh: 5000;
+            .volflow.cfg.reset[];
+            10000 = .volflow.cfg.blockSizeThresh
+
+    should restore weights to equal weighting after override
+
+        expect weights return to 6 equal values after reset
+            .volflow.cfg.weights: `ofiScore`vpinScore`flowConcScore`pocScore`aggrRatioScore`volImbalScore!0.5 0.1 0.1 0.1 0.1 0.1f;
+            .volflow.cfg.reset[];
+            all (abs each value .volflow.cfg.weights - 1f%6f) < 1e-4
+
+
+// ---------------------------------------------------------------------------
+// AC3 — DIRECTION SIGNAL THRESHOLDS
+// ---------------------------------------------------------------------------
+
+feature volflow direction signal thresholds
+
+    before
+        if[not `processOneBucket_ in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+        .volflow.cfg.reset[]
+
+    should return +1h when compositeScore exceeds bullThresh
+
+        expect signal is +1h for compositeScore 0.72f
+            1h = .volflow.classifySignal_[0.72f; 0.6f; 0.4f]
+
+        expect signal is +1h for compositeScore exactly at bullThresh boundary (0.6f excluded)
+            1h = .volflow.classifySignal_[0.61f; 0.6f; 0.4f]
+
+    should return -1h when compositeScore is below bearThresh
+
+        expect signal is -1h for compositeScore 0.35f
+            -1h = .volflow.classifySignal_[0.35f; 0.6f; 0.4f]
+
+        expect signal is -1h for compositeScore just below bearThresh
+            -1h = .volflow.classifySignal_[0.39f; 0.6f; 0.4f]
+
+    should return 0h when compositeScore is in neutral zone
+
+        expect signal is 0h for compositeScore 0.52f (between 0.4f and 0.6f)
+            0h = .volflow.classifySignal_[0.52f; 0.6f; 0.4f]
+
+        expect signal is 0h for compositeScore exactly at bullThresh (0.6f not exceeded)
+            0h = .volflow.classifySignal_[0.6f; 0.6f; 0.4f]
+
+        expect signal is 0h for compositeScore exactly at bearThresh (0.4f not exceeded)
+            0h = .volflow.classifySignal_[0.4f; 0.6f; 0.4f]
+
+    should return 0h when compositeScore is null (AC3)
+
+        expect signal is 0h for null compositeScore
+            0h = .volflow.classifySignal_[0Nf; 0.6f; 0.4f]
+
+    should return short type
+
+        expect result type is short (-5h)
+            -5h = type .volflow.classifySignal_[0.72f; 0.6f; 0.4f]
+
+
+// ---------------------------------------------------------------------------
+// AC1 + AC8 — BUCKET SIGNAL COMPUTATION (HAPPY PATH)
+// Tests processOneBucket_ directly — the core computation kernel.
+// BDD Scenario: "Happy path — update produces a complete signal row"
+// ---------------------------------------------------------------------------
+
+feature processOneBucket_ happy path — full data produces valid result row
+
+    before
+        if[not `processOneBucket_ in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+        .volflow.cfg.reset[]
+
+    should return a single-row flat table with all 17 required columns
+
+        expect 17 columns in result
+            17 = count cols .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000 09:33:01.000 09:34:01.000 09:35:01.000 09:36:01.000 09:37:01.000 09:38:01.000 09:39:01.000t;
+                    price:100 101 102 103 104 105 106 107 108 109f;
+                    size:100 200 150 300 100 250 100 200 300 150j;
+                    side:`B`S`B`B`S`B`S`B`S`B);
+                ([] sym:10#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500 09:33:00.500 09:34:00.500 09:35:00.500 09:36:00.500 09:37:00.500 09:38:00.500 09:39:00.500t;
+                    bid:10#99.5f; ask:10#100.5f; bsize:10#100j; asize:10#100j);
+                .volflow.cfg]
+
+        expect exact column order matches output schema
+            `date`sym`bucket`ofi`ofiScore`vpin`vpinScore`flowConc`flowConcScore`poc`pocScore`aggrRatio`aggrRatioScore`volImbal`volImbalScore`compositeScore`signal ~ cols .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000 09:33:01.000 09:34:01.000 09:35:01.000 09:36:01.000 09:37:01.000 09:38:01.000 09:39:01.000t;
+                    price:100 101 102 103 104 105 106 107 108 109f;
+                    size:100 200 150 300 100 250 100 200 300 150j;
+                    side:`B`S`B`B`S`B`S`B`S`B);
+                ([] sym:10#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500 09:33:00.500 09:34:00.500 09:35:00.500 09:36:00.500 09:37:00.500 09:38:00.500 09:39:00.500t;
+                    bid:10#99.5f; ask:10#100.5f; bsize:10#100j; asize:10#100j);
+                .volflow.cfg]
+
+        expect result is a keyed or unkeyed table (type 98 or 99)
+            r: .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000 09:33:01.000 09:34:01.000 09:35:01.000 09:36:01.000 09:37:01.000 09:38:01.000 09:39:01.000t;
+                    price:100 101 102 103 104 105 106 107 108 109f;
+                    size:100 200 150 300 100 250 100 200 300 150j;
+                    side:`B`S`B`B`S`B`S`B`S`B);
+                ([] sym:10#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500 09:33:00.500 09:34:00.500 09:35:00.500 09:36:00.500 09:37:00.500 09:38:00.500 09:39:00.500t;
+                    bid:10#99.5f; ask:10#100.5f; bsize:10#100j; asize:10#100j);
+                .volflow.cfg];
+            type[r] in 98 99h
+
+        expect exactly 1 row in result
+            1 = count .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000 09:33:01.000 09:34:01.000 09:35:01.000 09:36:01.000 09:37:01.000 09:38:01.000 09:39:01.000t;
+                    price:100 101 102 103 104 105 106 107 108 109f;
+                    size:100 200 150 300 100 250 100 200 300 150j;
+                    side:`B`S`B`B`S`B`S`B`S`B);
+                ([] sym:10#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500 09:33:00.500 09:34:00.500 09:35:00.500 09:36:00.500 09:37:00.500 09:38:00.500 09:39:00.500t;
+                    bid:10#99.5f; ask:10#100.5f; bsize:10#100j; asize:10#100j);
+                .volflow.cfg]
+
+    should populate sym, date, and bucket identity columns correctly
+
+        expect sym is AAPL
+            `AAPL = first .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000t; price:100 101f; size:100 200j; side:`B`S);
+                ([] sym:2#`AAPL; time:09:30:00.500 09:31:00.500t; bid:2#99.5f; ask:2#100.5f; bsize:2#100j; asize:2#100j);
+                .volflow.cfg][`sym]
+
+        expect date is 2026.05.10
+            2026.05.10 = first .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000t; price:100 101f; size:100 200j; side:`B`S);
+                ([] sym:2#`AAPL; time:09:30:00.500 09:31:00.500t; bid:2#99.5f; ask:2#100.5f; bsize:2#100j; asize:2#100j);
+                .volflow.cfg][`date]
+
+        expect bucket matches the supplied bucket start time
+            09:30:00.000t = first .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000t; price:100 101f; size:100 200j; side:`B`S);
+                ([] sym:2#`AAPL; time:09:30:00.500 09:31:00.500t; bid:2#99.5f; ask:2#100.5f; bsize:2#100j; asize:2#100j);
+                .volflow.cfg][`bucket]
+
+    should have all six score columns in [0f, 1f] with no nulls
+
+        expect no nulls in any score column
+            r: .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000 09:33:01.000 09:34:01.000 09:35:01.000 09:36:01.000 09:37:01.000 09:38:01.000 09:39:01.000t;
+                    price:100 101 102 103 104 105 106 107 108 109f;
+                    size:100 200 150 300 100 250 100 200 300 150j;
+                    side:`B`S`B`B`S`B`S`B`S`B);
+                ([] sym:10#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500 09:33:00.500 09:34:00.500 09:35:00.500 09:36:00.500 09:37:00.500 09:38:00.500 09:39:00.500t;
+                    bid:10#99.5f; ask:10#100.5f; bsize:10#100j; asize:10#100j);
+                .volflow.cfg];
+            sc: r `ofiScore`vpinScore`flowConcScore`pocScore`aggrRatioScore`volImbalScore;
+            not any {any null x} each sc
+
+        expect all six score values are in [0f, 1f]
+            r: .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000 09:33:01.000 09:34:01.000 09:35:01.000 09:36:01.000 09:37:01.000 09:38:01.000 09:39:01.000t;
+                    price:100 101 102 103 104 105 106 107 108 109f;
+                    size:100 200 150 300 100 250 100 200 300 150j;
+                    side:`B`S`B`B`S`B`S`B`S`B);
+                ([] sym:10#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500 09:33:00.500 09:34:00.500 09:35:00.500 09:36:00.500 09:37:00.500 09:38:00.500 09:39:00.500t;
+                    bid:10#99.5f; ask:10#100.5f; bsize:10#100j; asize:10#100j);
+                .volflow.cfg];
+            sc: r `ofiScore`vpinScore`flowConcScore`pocScore`aggrRatioScore`volImbalScore;
+            all {all (x>=0f) and (x<=1f)} each sc
+
+        expect compositeScore is in [0f, 1f]
+            r: .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000 09:33:01.000 09:34:01.000 09:35:01.000 09:36:01.000 09:37:01.000 09:38:01.000 09:39:01.000t;
+                    price:100 101 102 103 104 105 106 107 108 109f;
+                    size:100 200 150 300 100 250 100 200 300 150j;
+                    side:`B`S`B`B`S`B`S`B`S`B);
+                ([] sym:10#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500 09:33:00.500 09:34:00.500 09:35:00.500 09:36:00.500 09:37:00.500 09:38:00.500 09:39:00.500t;
+                    bid:10#99.5f; ask:10#100.5f; bsize:10#100j; asize:10#100j);
+                .volflow.cfg];
+            cs: r[0;`compositeScore];
+            (not null cs) and (cs >= 0f) and (cs <= 1f)
+
+    should have signal as short type
+
+        expect signal column is type short (-5h)
+            r: .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000t; price:100 101 102f; size:100 200 150j; side:`B`S`B);
+                ([] sym:3#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500t; bid:3#99.5f; ask:3#100.5f; bsize:3#100j; asize:3#100j);
+                .volflow.cfg];
+            -5h = type r[0;`signal]
+
+        expect signal is one of +1h, 0h, -1h
+            r: .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000t; price:100 101 102f; size:100 200 150j; side:`B`S`B);
+                ([] sym:3#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500t; bid:3#99.5f; ask:3#100.5f; bsize:3#100j; asize:3#100j);
+                .volflow.cfg];
+            r[0;`signal] in -1 0 1h
+
+
+// ---------------------------------------------------------------------------
+// AC2 — COMPOSITE SCORE COMPUTATION
+// BDD Scenario: "Composite score is the equal-weighted mean of six signal scores"
+// ---------------------------------------------------------------------------
+
+feature composite score computation — equal-weighted default
+
+    before
+        if[not `processOneBucket_ in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+        .volflow.cfg.reset[]
+
+    should compute compositeScore as weighted mean of six score columns
+
+        expect compositeScore matches sum of weighted scores to 1e-6 tolerance
+            r: .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000 09:33:01.000 09:34:01.000 09:35:01.000 09:36:01.000 09:37:01.000 09:38:01.000 09:39:01.000t;
+                    price:100 101 102 103 104 105 106 107 108 109f;
+                    size:100 200 150 300 100 250 100 200 300 150j;
+                    side:`B`S`B`B`S`B`S`B`S`B);
+                ([] sym:10#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500 09:33:00.500 09:34:00.500 09:35:00.500 09:36:00.500 09:37:00.500 09:38:00.500 09:39:00.500t;
+                    bid:10#99.5f; ask:10#100.5f; bsize:10#100j; asize:10#100j);
+                .volflow.cfg];
+            cs: r[0;`compositeScore];
+            w: .volflow.cfg.weights;
+            sc: r[0;`ofiScore`vpinScore`flowConcScore`pocScore`aggrRatioScore`volImbalScore];
+            expected: sum w * sc;
+            1e-6 > abs cs - expected
+
+    should use overridden weights when cfg.weights is changed (AC2)
+
+        expect compositeScore reflects custom weight giving full weight to ofi
+            .volflow.cfg.weights: `ofiScore`vpinScore`flowConcScore`pocScore`aggrRatioScore`volImbalScore!0.5 0.1 0.1 0.1 0.1 0.1f;
+            r: .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000 09:33:01.000 09:34:01.000 09:35:01.000 09:36:01.000 09:37:01.000 09:38:01.000 09:39:01.000t;
+                    price:100 101 102 103 104 105 106 107 108 109f;
+                    size:100 200 150 300 100 250 100 200 300 150j;
+                    side:`B`S`B`B`S`B`S`B`S`B);
+                ([] sym:10#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500 09:33:00.500 09:34:00.500 09:35:00.500 09:36:00.500 09:37:00.500 09:38:00.500 09:39:00.500t;
+                    bid:10#99.5f; ask:10#100.5f; bsize:10#100j; asize:10#100j);
+                .volflow.cfg];
+            cs: r[0;`compositeScore];
+            w: .volflow.cfg.weights;
+            sc: r[0;`ofiScore`vpinScore`flowConcScore`pocScore`aggrRatioScore`volImbalScore];
+            expected: sum w * sc;
+            .volflow.cfg.reset[];
+            1e-4 > abs cs - expected
+
+    should have no nested lists or dictionaries in result (AC8)
+
+        expect all columns contain primitive q types
+            r: .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000t; price:100 101 102f; size:100 200 150j; side:`B`S`B);
+                ([] sym:3#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500t; bid:3#99.5f; ask:3#100.5f; bsize:3#100j; asize:3#100j);
+                .volflow.cfg];
+            not any (type each flip r) in 0 77 78 99 100 101h
+
+
+// ---------------------------------------------------------------------------
+// AC6 — EMPTY BUCKET: NULL SCORES WITHOUT ERROR
+// BDD Scenario: "Empty bucket returns null scores without error"
+// ---------------------------------------------------------------------------
+
+feature empty bucket returns null scores without error
+
+    before
+        if[not `processOneBucket_ in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+        .volflow.cfg.reset[]
+
+    should return a row with all raw signal columns null when trades are empty
+
+        expect ofi is null on empty tradeDelta
+            null first .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                .volflow.emptyT_; .volflow.emptyQ_; .volflow.cfg][`ofi]
+
+        expect vpin is null on empty tradeDelta
+            null first .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                .volflow.emptyT_; .volflow.emptyQ_; .volflow.cfg][`vpin]
+
+        expect flowConc is null on empty tradeDelta
+            null first .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                .volflow.emptyT_; .volflow.emptyQ_; .volflow.cfg][`flowConc]
+
+        expect poc is null on empty tradeDelta
+            null first .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                .volflow.emptyT_; .volflow.emptyQ_; .volflow.cfg][`poc]
+
+        expect aggrRatio is null on empty tradeDelta
+            null first .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                .volflow.emptyT_; .volflow.emptyQ_; .volflow.cfg][`aggrRatio]
+
+        expect volImbal is null on empty tradeDelta
+            null first .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                .volflow.emptyT_; .volflow.emptyQ_; .volflow.cfg][`volImbal]
+
+    should return null compositeScore when trades are empty
+
+        expect compositeScore is null when tradeDelta is empty
+            null first .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                .volflow.emptyT_; .volflow.emptyQ_; .volflow.cfg][`compositeScore]
+
+    should return signal = 0h when compositeScore is null (AC6, AC3)
+
+        expect signal is 0h when trades are empty
+            0h = first .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                .volflow.emptyT_; .volflow.emptyQ_; .volflow.cfg][`signal]
+
+    should not raise a q signal on empty input (AC6)
+
+        expect no error raised for empty tradeDelta
+            .[.volflow.processOneBucket_; (`AAPL; 2026.05.10; 09:30:00.000t;
+                .volflow.emptyT_; .volflow.emptyQ_; .volflow.cfg); {0b}];
+            1b
+
+
+// ---------------------------------------------------------------------------
+// AC10 — LARGE-ORDER FLOW CONCENTRATION
+// BDD Scenario: "Large-Order Flow Concentration signal"
+// ---------------------------------------------------------------------------
+
+feature large-order flow concentration (AC10)
+
+    before
+        if[not `processOneBucket_ in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+        .volflow.cfg.reset[]
+
+    should compute flowConc as fraction of volume from block trades
+
+        expect flowConc equals block volume / total volume
+            r: .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000 09:33:01.000 09:34:01.000t;
+                    price:100 101 102 103 104f;
+                    size:100 200 150 15000 100j;
+                    side:`B`S`B`B`S);
+                ([] sym:5#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500 09:33:00.500 09:34:00.500t;
+                    bid:5#99.5f; ask:5#100.5f; bsize:5#100j; asize:5#100j);
+                .volflow.cfg];
+            expected: 15000f % (100+200+150+15000+100);
+            1e-4 > abs r[0;`flowConc] - expected
+
+    should return flowConc = 0f when no block trades present
+
+        expect flowConc is 0f when all sizes below blockSizeThresh
+            r: .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000t;
+                    price:100 101 102f;
+                    size:100 200 150j;
+                    side:`B`S`B);
+                ([] sym:3#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500t;
+                    bid:3#99.5f; ask:3#100.5f; bsize:3#100j; asize:3#100j);
+                .volflow.cfg];
+            0f = r[0;`flowConc]
+
+    should return flowConc = 1f when all trades are block trades
+
+        expect flowConc is 1f when all sizes above blockSizeThresh
+            r: .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000t;
+                    price:100 101f;
+                    size:15000 20000j;
+                    side:`B`S);
+                ([] sym:2#`AAPL; time:09:30:00.500 09:31:00.500t;
+                    bid:2#99.5f; ask:2#100.5f; bsize:2#100j; asize:2#100j);
+                .volflow.cfg];
+            1f = r[0;`flowConc]
+
+    should respect overridden blockSizeThresh in cfg
+
+        expect flowConc > 0 when blockSizeThresh lowered to capture 200-share trades
+            .volflow.cfg.blockSizeThresh: 200;
+            r: .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000t;
+                    price:100 101 102f;
+                    size:100 200 150j;
+                    side:`B`S`B);
+                ([] sym:3#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500t;
+                    bid:3#99.5f; ask:3#100.5f; bsize:3#100j; asize:3#100j);
+                .volflow.cfg];
+            .volflow.cfg.reset[];
+            r[0;`flowConc] > 0f
+
+
+// ---------------------------------------------------------------------------
+// AC1 (EDGE CASE) — SINGLE-ROW TRADE
+// ---------------------------------------------------------------------------
+
+feature single-trade bucket returns valid row without error
+
+    before
+        if[not `processOneBucket_ in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+        .volflow.cfg.reset[]
+
+    should return a table with 17 columns for a single-trade input
+
+        expect 17 columns returned for 1 trade
+            17 = count cols .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:enlist 09:30:01.000t; price:enlist 100f; size:enlist 200j; side:enlist `B);
+                ([] sym:enlist`AAPL; time:enlist 09:30:00.500t; bid:enlist 99.5f; ask:enlist 100.5f; bsize:enlist 100j; asize:enlist 100j);
+                .volflow.cfg]
+
+        expect exactly 1 row returned for 1 trade
+            1 = count .volflow.processOneBucket_[`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:enlist 09:30:01.000t; price:enlist 100f; size:enlist 200j; side:enlist `B);
+                ([] sym:enlist`AAPL; time:enlist 09:30:00.500t; bid:enlist 99.5f; ask:enlist 100.5f; bsize:enlist 100j; asize:enlist 100j);
+                .volflow.cfg]
+
+        expect no q signal is raised for single-trade input
+            98h = type .[.volflow.processOneBucket_; (`AAPL; 2026.05.10; 09:30:00.000t;
+                ([] time:enlist 09:30:01.000t; price:enlist 100f; size:enlist 200j; side:enlist `B);
+                ([] sym:enlist`AAPL; time:enlist 09:30:00.500t; bid:enlist 99.5f; ask:enlist 100.5f; bsize:enlist 100j; asize:enlist 100j);
+                .volflow.cfg); {0N}]
+
+
+// ---------------------------------------------------------------------------
+// AC9 — STATE MANAGEMENT
+// ---------------------------------------------------------------------------
+
+feature state management — resetState and resetAll
+
+    before
+        if[not `onUpdate in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+        .volflow.resetAll[]
+
+    should return empty dict for getState on unknown symbol
+
+        expect getState returns empty dict for symbol with no state
+            r: .volflow.getState `NEWSYM;
+            (0 = count r) and (99h = type r)
+
+    should remove symbol from state after resetState
+
+        expect AAPL absent from state after resetState
+            .volflow.state_[`AAPL]: `x`y!(1;2);
+            .volflow.resetState `AAPL;
+            not `AAPL in key .volflow.state_
+
+    should clear all state after resetAll
+
+        expect state is empty after resetAll
+            .volflow.resetState `AAPL;
+            .volflow.resetAll[];
+            0 = count key .volflow.state_
+
+
+// ---------------------------------------------------------------------------
+// AC7 — NON-EQUITY SYMBOL ERRORS
+// BDD Scenario: "Non-equity symbol raises a descriptive error"
+// [IMPL PENDING — update currently returns :: instead of raising a signal]
+// ---------------------------------------------------------------------------
+
+feature non-equity symbol rejected by update (AC7)
+
+    before
+        if[not `onUpdate in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+        .volflow.cfg.reset[]
+        .volflow.resetAll[]
+
+    should raise a q signal for FX symbol GBPUSD
+
+        expect error is raised for FX symbol
+            .[.volflow.onUpdate;
+                (`GBPUSD; 2026.05.10; 09:35:00.000t; .volflow.emptyT_; (); .volflow.emptyQ_);
+                {1b}]
+
+        expect error message contains "not equity" for FX symbol
+            err: .[.volflow.onUpdate;
+                (`GBPUSD; 2026.05.10; 09:35:00.000t; .volflow.emptyT_; (); .volflow.emptyQ_);
+                {x}];
+            err like "*not equity*"
+
+    should raise a q signal for unknown symbol UNKN
+
+        expect error is raised for symbol not in instrument table
+            .[.volflow.onUpdate;
+                (`UNKN; 2026.05.10; 09:35:00.000t; .volflow.emptyT_; (); .volflow.emptyQ_);
+                {1b}]
+
+feature non-equity symbol rejected by calcDay (AC7)
+
+    before
+        if[not `onUpdate in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+        .volflow.cfg.reset[]
+
+    should raise a q signal for FX symbol in calcDay
+
+        expect calcDay errors on GBPUSD
+            .[.volflow.calcDay;
+                (`GBPUSD; 2026.05.09);
+                {1b}]
+
+    should raise a q signal for unknown symbol in calcDay
+
+        expect calcDay errors on symbol not in instrument table
+            .[.volflow.calcDay;
+                (`UNKN; 2026.05.09);
+                {1b}]
+
+
+// ---------------------------------------------------------------------------
+// AC7 — FUTURE DATE REJECTED BY calcDay
+// BDD Scenario: "Future date raises a descriptive error"
+// [IMPL PENDING — calcDay currently returns :: for future dates]
+// ---------------------------------------------------------------------------
+
+feature calcDay rejects future dates (AC7)
+
+    before
+        if[not `onUpdate in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+        .volflow.cfg.reset[]
+
+    should raise a q signal when date is after today
+
+        expect calcDay errors for date 2026.05.20 (future)
+            .[.volflow.calcDay;
+                (`AAPL; 2026.05.20);
+                {1b}]
+
+        expect error message contains "future date"
+            err: .[.volflow.calcDay;
+                (`AAPL; 2026.05.20);
+                {x}];
+            err like "*future date*"
+
+
+// ---------------------------------------------------------------------------
+// AC5 + AC8 — calcDay T+1 BATCH HAPPY PATH
+// BDD Scenario: "Happy path — calcDay returns one row per traded bucket"
+// [IMPL PENDING — calcDay currently returns ::]
+// ---------------------------------------------------------------------------
+
+feature calcDay T+1 batch happy path
+
+    before
+        if[not `onUpdate in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+        .volflow.cfg.reset[]
+
+    should return a flat table when HDB has trade data for the symbol / date
+
+        expect calcDay returns a table (type 98) for AAPL 2026.05.09
+            98h = type .volflow.calcDay[`AAPL; 2026.05.09]
+
+    should return results sorted ascending by bucket
+
+        expect bucket column is sorted ascending
+            r: .volflow.calcDay[`AAPL; 2026.05.09];
+            r[`bucket] ~ asc r[`bucket]
+
+    should return at least one row when trades exist
+
+        expect at least one row in result for AAPL 2026.05.09
+            0 < count .volflow.calcDay[`AAPL; 2026.05.09]
+
+    should stamp every row with the requested date and sym
+
+        expect every row has date = 2026.05.09
+            r: .volflow.calcDay[`AAPL; 2026.05.09];
+            all 2026.05.09 = r[`date]
+
+        expect every row has sym = AAPL
+            r: .volflow.calcDay[`AAPL; 2026.05.09];
+            all `AAPL = r[`sym]
+
+    should contain all 17 output columns
+
+        expect 17 columns in calcDay result
+            17 = count cols .volflow.calcDay[`AAPL; 2026.05.09]
+
+    should have each compositeScore in [0f, 1f]
+
+        expect all compositeScores in [0f, 1f]
+            r: .volflow.calcDay[`AAPL; 2026.05.09];
+            all {(not null x) and (x>=0f) and (x<=1f)} each r[`compositeScore]
+
+    should have each signal value as one of +1h, 0h, -1h
+
+        expect all signal values are valid short codes
+            r: .volflow.calcDay[`AAPL; 2026.05.09];
+            all r[`signal] in -1 0 1h
+
+
+// ---------------------------------------------------------------------------
+// AC4 + AC1 — STREAMING UPDATE HAPPY PATH
+// BDD Scenario: "Happy path — update produces a complete signal row"
+// [IMPL PENDING — update currently returns :: and does not populate state_]
+// ---------------------------------------------------------------------------
+
+feature streaming update happy path
+
+    before
+        if[not `onUpdate in key `.volflow; '"volflow not loaded — see setup_code in file header"]
+        .volflow.cfg.reset[]
+        .volflow.resetAll[]
+
+    should return a result row when called with valid trade/quote delta tables
+
+        expect onUpdate returns a table (not ::)
+            r: .volflow.onUpdate[`AAPL; 2026.05.10; 09:35:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000 09:33:01.000 09:34:01.000 09:35:01.000 09:36:01.000 09:37:01.000 09:38:01.000 09:39:01.000t;
+                    price:100 101 102 103 104 105 106 107 108 109f;
+                    size:100 200 150 300 100 250 100 200 300 150j;
+                    side:`B`S`B`B`S`B`S`B`S`B);
+                ();
+                ([] sym:10#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500 09:33:00.500 09:34:00.500 09:35:00.500 09:36:00.500 09:37:00.500 09:38:00.500 09:39:00.500t;
+                    bid:10#99.5f; ask:10#100.5f; bsize:10#100j; asize:10#100j)];
+            type[r] in 98 99h
+
+    should accumulate intraday state for the symbol after calling update
+
+        expect AAPL is present in state_ after an onUpdate call
+            .volflow.resetAll[];
+            .volflow.onUpdate[`AAPL; 2026.05.10; 09:35:00.000t;
+                ([] time:09:30:01.000 09:31:01.000 09:32:01.000 09:33:01.000 09:34:01.000 09:35:01.000 09:36:01.000 09:37:01.000 09:38:01.000 09:39:01.000t;
+                    price:100 101 102 103 104 105 106 107 108 109f;
+                    size:100 200 150 300 100 250 100 200 300 150j;
+                    side:`B`S`B`B`S`B`S`B`S`B);
+                ();
+                ([] sym:10#`AAPL; time:09:30:00.500 09:31:00.500 09:32:00.500 09:33:00.500 09:34:00.500 09:35:00.500 09:36:00.500 09:37:00.500 09:38:00.500 09:39:00.500t;
+                    bid:10#99.5f; ask:10#100.5f; bsize:10#100j; asize:10#100j)];
+            `AAPL in key .volflow.state_

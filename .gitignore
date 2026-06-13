@@ -24,3 +24,5 @@ vendor/ax-libraries.zip
 
 # Local JIRA / task memory — agent handover files, not for version control
 .memory/
+research/
+memos/
