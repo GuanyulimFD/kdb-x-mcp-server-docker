@@ -1,0 +1,142 @@
+/ ============================================================================
+/ qcumber tests for rm-agent module
+/ Feature: AI Relationship Manager q analytics
+/
+/ Run via:
+/   kdbx_q_unit_test MCP tool with setup_code loading this module
+/ ============================================================================
+
+feature ingestOhlcv: store OHLCV records in rmag_ohlcv
+
+    before
+        / Load the module if not already loaded
+        if[not `.rmag.ingestOhlcv in key `.; system "l q-modules/rm-agent/rm-agent.q"];
+        / Seed sample data — AAPL, 5 days
+        sampleDates  :: ("2024-01-02";"2024-01-03";"2024-01-04";"2024-01-05";"2024-01-08")
+        sampleSyms   :: `AAPL`AAPL`AAPL`AAPL`AAPL
+        sampleOpens  :: 185.0 186.0 184.5 187.0 189.0
+        sampleHighs  :: 187.0 188.5 186.0 190.0 191.5
+        sampleLows   :: 184.0 185.5 183.5 186.5 188.0
+        sampleCloses :: 186.5 187.8 185.2 189.5 190.8
+        sampleVols   :: 55000000 58000000 52000000 61000000 59000000
+
+    before each
+        / Clear table before each should
+        .rmag.rmag_ohlcv :: ([]date:`date$();sym:`$();open:`float$();high:`float$();low:`float$();close:`float$();vol:`long$())
+
+    should insert records and return count
+        expect returns count of inserted rows
+            n: .rmag.ingestOhlcv[sampleDates;sampleSyms;sampleOpens;sampleHighs;sampleLows;sampleCloses;sampleVols];
+            5=n
+
+        expect records appear in rmag_ohlcv
+            .rmag.ingestOhlcv[sampleDates;sampleSyms;sampleOpens;sampleHighs;sampleLows;sampleCloses;sampleVols];
+            0<count .rmag.rmag_ohlcv
+
+    should reject mismatched input lengths
+        expect signals an error on mismatched lists
+            @[.rmag.ingestOhlcv;
+              (sampleDates;1_sampleSyms;sampleOpens;sampleHighs;sampleLows;sampleCloses;sampleVols);
+              {1b}]
+
+feature computeMetrics: compute Sharpe, CAGR, drawdown, vol
+
+    before
+        if[not `.rmag.computeMetrics in key `.; system "l q-modules/rm-agent/rm-agent.q"];
+        / Seed 60 days of synthetic AAPL data (monotone increasing for stable test)
+        n: 60;
+        dates: (.z.d - n) + til n;
+        prices: 100f + 0.5f * til n;   / smooth uptrend for deterministic metrics
+        .rmag.rmag_ohlcv,:
+            ([]date:dates; sym:n#`AAPL; open:prices-0.5; high:prices+0.5;
+               low:prices-0.8; close:prices; vol:n#50000000)
+
+    should return a dict keyed by symbol
+        expect result is a dict with AAPL key
+            result: .rmag.computeMetrics[enlist `AAPL; 90];
+            `AAPL in key result
+
+    should include all five metric keys
+        expect all five metric keys present for AAPL
+            result: .rmag.computeMetrics[enlist `AAPL; 90];
+            m: result `AAPL;
+            all (`cumulative_return`sharpe_ratio`max_drawdown`cagr`annualised_volatility) in key m
+
+    should return positive CAGR for uptrending prices
+        expect CAGR is positive
+            result: .rmag.computeMetrics[enlist `AAPL; 90];
+            0f < result[`AAPL][`cagr]
+
+    should return negative max_drawdown
+        expect max_drawdown is non-positive
+            result: .rmag.computeMetrics[enlist `AAPL; 90];
+            0f >= result[`AAPL][`max_drawdown]
+
+    should return empty dict for unknown symbol
+        expect empty result for unknown symbol
+            result: .rmag.computeMetrics[enlist `ZZZZ; 90];
+            0=count result
+
+    should handle single-observation symbol gracefully
+        expect empty result when only 1 data point
+            .rmag.rmag_ohlcv,:
+                enlist([]date:.z.d-1; sym:`SOLO; open:50f; high:51f; low:49f; close:50f; vol:100000);
+            result: .rmag.computeMetrics[enlist `SOLO; 90];
+            0=count result
+
+feature equityCurveData: cumulative return series for charting
+
+    before
+        if[not `.rmag.equityCurveData in key `.; system "l q-modules/rm-agent/rm-agent.q"];
+        n: 30;
+        dates: (.z.d - n) + til n;
+        prices: 100f + til n;
+        .rmag.rmag_ohlcv,:
+            ([]date:dates; sym:n#`TSLA; open:prices; high:prices+1; low:prices-1;
+               close:prices; vol:n#30000000)
+
+    should return a table with expected columns
+        expect table has date sym cum_return_pct columns
+            t: .rmag.equityCurveData[enlist `TSLA; 60];
+            all (`date`sym`cum_return_pct) in cols t
+
+    should start at 0 for first data point
+        expect first cumulative return is 0 (rebased)
+            t: `date xasc .rmag.equityCurveData[enlist `TSLA; 60];
+            t: select from t where sym=`TSLA;
+            .qu.compare[0f; first t`cum_return_pct]
+
+    should return empty table for unknown symbol
+        expect empty table for unknown symbol
+            t: .rmag.equityCurveData[enlist `NODATA; 60];
+            0=count t
+
+feature ingestNews and searchNews: store and retrieve ranked articles
+
+    before
+        if[not `.rmag.searchNews in key `.; system "l q-modules/rm-agent/rm-agent.q"];
+        .rmag.rmag_news ::([]id:`long$();title:`$();url:`$();source:`$();published:`$();summary:`$();sentiment:`float$();sent_label:`$();syms:`$());
+        titles_    :: ("AAPL hits all-time high"; "MSFT cloud growth accelerates"; "Macro concerns weigh on tech")
+        urls_      :: ("http://a.com/1"; "http://a.com/2"; "http://a.com/3")
+        sources_   :: ("Reuters"; "Bloomberg"; "CNBC")
+        published_ :: ("20240101T090000"; "20240102T100000"; "20240103T110000")
+        summaries_ :: ("Apple stock rose ..."; "Microsoft Azure ..."; "Interest rates ...")
+        scores_    :: (0.8f; 0.6f; -0.3f)
+        labels_    :: (`Bullish; `Bullish; `Bearish)
+        symStrs_   :: (`AAPL; `MSFT; `AAPL`MSFT)
+
+    should insert news and return count
+        expect 3 rows inserted
+            n: .rmag.ingestNews[titles_;urls_;sources_;published_;summaries_;scores_;labels_;string each symStrs_];
+            3=n
+
+    should return ranked results for known symbols
+        expect searchNews returns at least 1 result
+            .rmag.ingestNews[titles_;urls_;sources_;published_;summaries_;scores_;labels_;string each symStrs_];
+            results: .rmag.searchNews[`AAPL`MSFT; `"tech outlook"; 10];
+            0<count results
+
+    should return empty table when rmag_news is empty
+        expect empty result when no news stored
+            results: .rmag.searchNews[`AAPL; `"query"; 10];
+            0=count results
