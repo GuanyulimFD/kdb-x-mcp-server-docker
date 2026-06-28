@@ -38,7 +38,7 @@
 //              to the DAP startup configuration (e.g. via KDBX_INIT_SCRIPT env var
 //              or by referencing it in the docker-compose .env).
 //
-// Version:     0.3.0
+// Version:     0.4.0
 // Requires:    KDB-X DB Service (preview) + KDB-X 5.0
 // Author:      kdb-ai-demo-agent
 // ============================================================================
@@ -68,7 +68,7 @@ require_:{[cond;msg] if[not cond; logE_ string msg; 'msg]}
 / @throws if rmag_ohlcv table is empty
 / @example .rmag.computeMetrics[`AAPL`MSFT`TSM; 90]
 computeMetrics:{[syms;lookbackDays]
-    require_[0<count rmag_ohlcv; `"computeMetrics: no OHLCV data — run the feed poller first"];
+    require_[0<count rmag_ohlcv; `$"computeMetrics: no OHLCV data - run the feed poller first"];
     logI_ "computeMetrics: ",(" " sv string syms)," lookback=",string lookbackDays;
 
     cutoff: .z.d - lookbackDays;
@@ -112,7 +112,7 @@ computeMetrics:{[syms;lookbackDays]
 / @throws if rmag_ohlcv table is empty
 / @example .rmag.equityCurveData[`AAPL`MSFT; 90]
 equityCurveData:{[syms;lookbackDays]
-    require_[0<count rmag_ohlcv; `"equityCurveData: no OHLCV data available"];
+    require_[0<count rmag_ohlcv; `$"equityCurveData: no OHLCV data available"];
     logI_ "equityCurveData: ",(" " sv string syms);
 
     cutoff: .z.d - lookbackDays;
@@ -159,11 +159,37 @@ searchNews:{[syms;query;limit]
     limit # delete score from ranked
     }
 
+// ── CEP event log API (delegates to .cep.* — requires cep-engine.q loaded) ──
+
+// @desc  Query the CEP event log with optional sym/evtType filters and row limit.
+//        Delegates to .cep.getEvents. Requires cep-engine.q to be loaded.
+// @param syms     {symbol[]} Filter by sym; pass () for all symbols
+// @param evtTypes {symbol[]} Filter by evtType; pass () for all types
+// @param lim      {long}     Maximum rows to return (must be > 0)
+// @return {table} Event log rows (evtId, ts, sym, evtType, severity, val, thrshVal, msg)
+// @example .rmag.getEvents[`AAPL`MSFT; enlist `PRICE_ALERT; 50]
+getEvents:{[syms;evtTypes;lim]
+    require_[0<count key `.cep; `$"getEvents: cep-engine.q not loaded - load cep-engine.q first"];
+    .cep.getEvents[syms;evtTypes;lim]
+    }
+
+// @desc  Return events fired within the last windowMins minutes (open alerts).
+//        Delegates to .cep.getOpenAlerts. Requires cep-engine.q to be loaded.
+// @param syms       {symbol[]} Filter by sym; pass () for all symbols
+// @param windowMins {long}     Lookback window in minutes
+// @return {table} Recent event rows sorted descending by ts
+// @example .rmag.getOpenAlerts[`AAPL; 60]
+getOpenAlerts:{[syms;windowMins]
+    require_[0<count key `.cep; `$"getOpenAlerts: cep-engine.q not loaded - load cep-engine.q first"];
+    .cep.getOpenAlerts[syms;windowMins]
+    }
+
 // ── Module load banner ───────────────────────────────────────────────────────
 
 \d .
--1 "[rmag] v0.3.0 loaded — DB Service analytics module";
+-1 "[rmag] v0.4.0 loaded — DB Service analytics module";
 -1 "[rmag] Analytics : .rmag.computeMetrics | .rmag.equityCurveData | .rmag.searchNews";
+-1 "[rmag] CEP API   : .rmag.getEvents | .rmag.getOpenAlerts (delegates to .cep.*)";
 -1 "[rmag] Data tier : rmag_ohlcv | rmag_news | rmag_quote | rmag_intraday (owned by DB Service SM)";
 -1 "[rmag] Interface : query via POST /api/v0/query/q on DB Service Gateway";
 

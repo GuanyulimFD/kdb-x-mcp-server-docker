@@ -1,0 +1,237 @@
+// ============================================================================
+// qcumber unit tests for cep-engine.q
+// Run via: kdbx_q_unit_test MCP tool
+// ============================================================================
+
+feature CEP engine - PRICE_ALERT rule
+
+    before
+        if[not `.cep in key `.; system "l /Users/guanyulim/kdb-x-mcp-server/q-modules/rm-agent/cep-engine.q"];
+        quotes :: ([]ts:2024.01.02D09:30:00.000000000+0 1;sym:`AAPL`MSFT;changePct:6.5 0.4;volume:5000000 600000j);
+        quotesFlat :: ([]ts:2024.01.02D09:30:00.000000000+0 1;sym:`AAPL`MSFT;changePct:0.5 -0.3;volume:1000000 500000j);
+
+    should fire for symbols with |changePct| >= threshold
+        expect result is a table
+            98h = type .cep.priceAlertRule[quotes; 2.0]
+
+        expect exactly one alert for AAPL
+            1 = count .cep.priceAlertRule[quotes; 2.0]
+
+        expect alert sym is AAPL
+            `AAPL in exec sym from .cep.priceAlertRule[quotes; 2.0]
+
+        expect evtType is PRICE_ALERT
+            `PRICE_ALERT in exec evtType from .cep.priceAlertRule[quotes; 2.0]
+
+        expect val matches changePct
+            .qu.compare[6.5; first exec val from .cep.priceAlertRule[quotes; 2.0]]
+
+        expect thrshVal matches threshold
+            .qu.compare[2.0; first exec thrshVal from .cep.priceAlertRule[quotes; 2.0]]
+
+    should assign HIGH severity when |changePct| >= 5%
+        expect severity is HIGH for 6.5% move
+            `HIGH in exec severity from .cep.priceAlertRule[quotes; 2.0]
+
+    should assign MEDIUM severity when 2% <= |changePct| < 5%
+        expect MEDIUM for 3% move
+            r: .cep.priceAlertRule[([]ts:enlist .z.p;sym:enlist `GOOG;changePct:enlist 3.0f;volume:enlist 1000000j);2.0];
+            `MEDIUM in exec severity from r
+
+    should return empty when no symbols breach threshold
+        expect empty result for flat quotes
+            0 = count .cep.priceAlertRule[quotesFlat; 2.0]
+
+    should raise error when changePct column is missing
+        expect error on missing column
+            badQ:([]ts:enlist .z.p;sym:enlist `AAPL;volume:enlist 1000000j);
+            .[.cep.priceAlertRule; (badQ; 2.0); {1b}]
+
+feature CEP engine - VOLUME_SPIKE rule
+
+    before
+        if[not `.cep in key `.; system "l /Users/guanyulim/kdb-x-mcp-server/q-modules/rm-agent/cep-engine.q"];
+        quotesSpike :: ([]ts:2024.01.02D09:30:00.000000000+0 1 2 3 4;sym:`AAPL`AAPL`AAPL`AAPL`AAPL;changePct:5#0.0;volume:1000000 1200000 1100000 900000 5000000j);
+        quotesFlat2 :: ([]ts:2024.01.02D09:30:00.000000000+0 1 2 3 4;sym:5#`MSFT;changePct:5#0.0;volume:5#1000000j);
+
+    should fire when latest volume exceeds nAvg * rolling average
+        expect result is a table
+            98h = type .cep.volumeSpikeRule[quotesSpike; 2.0]
+
+        expect one alert for AAPL
+            1 = count .cep.volumeSpikeRule[quotesSpike; 2.0]
+
+        expect evtType is VOLUME_SPIKE
+            `VOLUME_SPIKE in exec evtType from .cep.volumeSpikeRule[quotesSpike; 2.0]
+
+        expect severity is HIGH
+            `HIGH in exec severity from .cep.volumeSpikeRule[quotesSpike; 2.0]
+
+        expect val is the latest volume
+            .qu.compare[5000000f; first exec val from .cep.volumeSpikeRule[quotesSpike; 2.0]]
+
+    should return empty when volume is steady
+        expect no alert for flat volume
+            0 = count .cep.volumeSpikeRule[quotesFlat2; 2.0]
+
+    should handle single-row input without error
+        expect single row returns gracefully
+            singleRow:([]ts:enlist .z.p;sym:enlist `AAPL;changePct:enlist 0.0;volume:enlist 1000000j);
+            0 <= count .cep.volumeSpikeRule[singleRow; 2.0]
+
+feature CEP engine - MOMENTUM_SIGNAL rule
+
+    before
+        if[not `.cep in key `.; system "l /Users/guanyulim/kdb-x-mcp-server/q-modules/rm-agent/cep-engine.q"];
+        n21:21;
+        prices21:(200f-0.1*til 20),enlist 210f;
+        ohlcvGolden :: ([]date:(.z.d-n21)+til n21;sym:n21#`AAPL;open:prices21-0.5f;high:prices21+0.5f;low:prices21-1.0f;close:prices21;vol:n21#1000000);
+        prices21d:(180f+0.1*til 20),enlist 160f;
+        ohlcvDeath :: ([]date:(.z.d-n21)+til n21;sym:n21#`MSFT;open:prices21d-0.5f;high:prices21d+0.5f;low:prices21d-1.0f;close:prices21d;vol:n21#500000);
+
+    should detect golden cross
+        expect result is a table
+            98h = type .cep.momentumRule[ohlcvGolden]
+
+        expect MOMENTUM_GOLDEN event for AAPL
+            `MOMENTUM_GOLDEN in exec evtType from .cep.momentumRule[ohlcvGolden]
+
+        expect sym is AAPL
+            `AAPL in exec sym from .cep.momentumRule[ohlcvGolden]
+
+    should detect death cross
+        expect MOMENTUM_DEATH event for MSFT
+            `MOMENTUM_DEATH in exec evtType from .cep.momentumRule[ohlcvDeath]
+
+    should return empty when fewer than 2 rows
+        expect graceful empty on single row
+            singleOhlcv:([]date:enlist .z.d;sym:enlist `AAPL;open:enlist 100f;high:enlist 101f;low:enlist 99f;close:enlist 100f;vol:enlist 1000000);
+            0 <= count .cep.momentumRule[singleOhlcv]
+
+    should raise error on missing close column
+        expect error when close missing
+            badOhlcv:([]date:enlist .z.d;sym:enlist `AAPL;vol:enlist 1000000);
+            @[.cep.momentumRule; enlist badOhlcv; {1b}]
+
+feature CEP engine - DRAWDOWN_ALERT rule
+
+    before
+        if[not `.cep in key `.; system "l /Users/guanyulim/kdb-x-mcp-server/q-modules/rm-agent/cep-engine.q"];
+        n20:20;
+        ddPrices:100f-3f*til n20;
+        ohlcvDD :: ([]date:(.z.d-n20)+til n20;sym:n20#`MSFT;open:ddPrices-0.5f;high:ddPrices+0.5f;low:ddPrices-1f;close:ddPrices;vol:n20#500000);
+        ohlcvFlat :: ([]date:(.z.d-n20)+til n20;sym:n20#`AAPL;open:n20#100f;high:n20#101f;low:n20#99f;close:n20#100f;vol:n20#1000000);
+
+    should fire when rolling drawdown falls below threshold
+        expect result is a table
+            98h = type .cep.drawdownRule[ohlcvDD; -0.05]
+
+        expect one alert for MSFT
+            1 = count .cep.drawdownRule[ohlcvDD; -0.05]
+
+        expect evtType is DRAWDOWN_ALERT
+            `DRAWDOWN_ALERT in exec evtType from .cep.drawdownRule[ohlcvDD; -0.05]
+
+        expect severity is HIGH
+            `HIGH in exec severity from .cep.drawdownRule[ohlcvDD; -0.05]
+
+        expect val (drawdown) is negative
+            0f > first exec val from .cep.drawdownRule[ohlcvDD; -0.05]
+
+        expect val is below threshold
+            r: .cep.drawdownRule[ohlcvDD; -0.05];
+            (first exec val from r) < -0.05
+
+    should return empty for flat prices
+        expect no alert for stable prices
+            0 = count .cep.drawdownRule[ohlcvFlat; -0.05]
+
+    should return empty for shallow decline above threshold
+        expect no alert for 1% dip
+            shallowPrices:100f-0.2f*til 5;
+            n5:count shallowPrices;
+            ohlcvShallow:([]date:(.z.d-n5)+til n5;sym:n5#`GOOG;open:shallowPrices;high:shallowPrices+0.1f;low:shallowPrices-0.1f;close:shallowPrices;vol:n5#1000000);
+            0 = count .cep.drawdownRule[ohlcvShallow; -0.05]
+
+feature CEP engine - NEWS_ALERT rule
+
+    before
+        if[not `.cep in key `.; system "l /Users/guanyulim/kdb-x-mcp-server/q-modules/rm-agent/cep-engine.q"];
+        strongPositive :: ([]ts:enlist .z.p;sym:enlist `AAPL;title:enlist `$"Record earnings";url:enlist `$"http://reuters.com/1";source:enlist `Reuters;published:enlist `$"2024-01-02";summary:enlist `$"Apple beats Q4";sentiment:enlist 0.82f;sentLabel:enlist `Positive);
+        strongNegative :: ([]ts:enlist .z.p;sym:enlist `MSFT;title:enlist `$"Regulatory action";url:enlist `$"http://reuters.com/2";source:enlist `Reuters;published:enlist `$"2024-01-02";summary:enlist `$"MSFT faces probe";sentiment:enlist -0.75f;sentLabel:enlist `Negative);
+        neutralNews :: ([]ts:enlist .z.p;sym:enlist `GOOG;title:enlist `$"Routine update";url:enlist `$"http://reuters.com/3";source:enlist `Reuters;published:enlist `$"2024-01-02";summary:enlist `$"Google updates";sentiment:enlist 0.1f;sentLabel:enlist `Neutral);
+
+    should fire for strongly positive sentiment
+        expect result is a table
+            98h = type .cep.newsAlertRule[strongPositive; 0.5]
+
+        expect one alert for AAPL
+            1 = count .cep.newsAlertRule[strongPositive; 0.5]
+
+        expect evtType is NEWS_ALERT
+            `NEWS_ALERT in exec evtType from .cep.newsAlertRule[strongPositive; 0.5]
+
+        expect val matches sentiment
+            .qu.compare[0.82f; first exec val from .cep.newsAlertRule[strongPositive; 0.5]]
+
+        expect HIGH severity for sentiment >= 0.8
+            `HIGH in exec severity from .cep.newsAlertRule[strongPositive; 0.5]
+
+    should fire for strongly negative sentiment
+        expect negative sentiment triggers alert
+            r: .cep.newsAlertRule[strongNegative; 0.5];
+            1 = count r
+
+        expect val is negative
+            r: .cep.newsAlertRule[strongNegative; 0.5];
+            0f > first exec val from r
+
+    should return empty for neutral news
+        expect no alert for |sentiment| < 0.5
+            0 = count .cep.newsAlertRule[neutralNews; 0.5]
+
+    should raise error when sentiment column is missing
+        expect error when sentiment missing
+            badNews:([]ts:enlist .z.p;sym:enlist `AAPL;title:enlist `$"x");
+            .[.cep.newsAlertRule; (badNews; 0.5); {1b}]
+
+feature CEP engine - event log and query API
+
+    before each
+        if[not `.cep in key `.; system "l /Users/guanyulim/kdb-x-mcp-server/q-modules/rm-agent/cep-engine.q"];
+        `.cep.rmag_events set ([]evtId:`long$();ts:`timestamp$();sym:`$();evtType:`$();severity:`$();val:`float$();thrshVal:`float$();msg:`$());
+        e1:enlist `evtId`ts`sym`evtType`severity`val`thrshVal`msg!(0Nj;.z.p;`AAPL;`PRICE_ALERT;`HIGH;6.5f;2.0f;`$"test1");
+        e2:enlist `evtId`ts`sym`evtType`severity`val`thrshVal`msg!(0Nj;.z.p;`MSFT;`VOLUME_SPIKE;`HIGH;5000000f;3680000f;`$"test2");
+        .cep.appendEvents_[e1];
+        .cep.appendEvents_[e2];
+
+    should getEvents return all events when no filter
+        expect exactly two events in clean table
+            2 = count .cep.getEvents[();();100]
+
+    should getEvents filter by sym
+        expect one event for AAPL only
+            1 = count .cep.getEvents[enlist `AAPL;();100]
+
+    should getEvents filter by evtType
+        expect one event of type PRICE_ALERT
+            1 = count .cep.getEvents[();enlist `PRICE_ALERT;100]
+
+    should getEvents respect limit
+        expect limit 1 returns one row
+            1 = count .cep.getEvents[();();1]
+
+    should getOpenAlerts return events within window
+        expect recent events are within window
+            0 < count .cep.getOpenAlerts[();60]
+
+    should appendEvents_ assign sequential IDs
+        expect evtId 0 for first event
+            0j = first exec evtId from .cep.rmag_events
+
+        expect evtId 1 for second event
+            1j = last exec evtId from .cep.rmag_events
+
+    should getEvents raise error for invalid limit
+        expect error when lim is zero
+            .[.cep.getEvents; ((); (); 0); {1b}]

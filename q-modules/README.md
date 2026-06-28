@@ -51,3 +51,6 @@ bash scripts/test_q_analytics.sh
 | `cron` | `.cron` | Timer-driven cron job scheduler: register jobs with time windows, periods, and args; driven by `.z.ts` |
 | `tca` | `.tca` | T+1 TCA at equity parent order level: fill rate, trader hold time, exec hold time (GEP-1123) |
 | `volflow` | `.volflow` | Intraday volume flow signals (OFI, VPIN, flow concentration, POC, aggressor ratio, volume imbalance) over 30-min buckets; streaming CEP mode + T+1 batch mode; equity-only (GED-1123) |
+| `rm-agent/cep-engine` | `.cep` | Production CEP engine with 5 market event rules: PRICE_ALERT, VOLUME_SPIKE, MOMENTUM_SIGNAL, DRAWDOWN_ALERT, NEWS_ALERT. Provides event log API: `getEvents[syms;evtTypes;lim]` and `getOpenAlerts[syms;windowMins]`. 48 qcumber tests. |
+| `rm-agent/rm-agent` | `.rmag` | AI-RM analytics module (v0.4.0): `computeMetrics`, `equityCurveData`, `searchNews`, and CEP delegation via `getEvents`/`getOpenAlerts`. |
+| `rm-agent/schema` | `.rmagschema` | DB Service table schema definitions for the AI-RM demo: 5 prototype tables (rmag_ohlcv, rmag_quote, rmag_intraday, rmag_news, rmag_events) + `register[]` helper. |
