@@ -1,15 +1,21 @@
 """MCP tools for the AI Relationship Manager agent.
 
-These tools expose the q/.rmag.* functions as named MCP tools,
-callable by the kdb-ai-demo-agent via pykx IPC.
+Exposes .rmag.* q functions as named MCP tools via the KxSystems DB Service
+Gateway REST API (POST /api/v0/query/q on port 8080).
 
-Tools registered
-----------------
-kdbx_rm_ingest_ohlcv         - Bulk-insert OHLCV records into KDB-X
-kdbx_rm_ingest_news          - Store news articles in KDB-X (+ KDB.AI embeddings)
+Data ingestion (OHLCV, news) is performed directly by the feeds and the
+agent's data_fetch_node via the DB Service imports API — NOT through these
+MCP tools.
+
+Tools registered (7)
+--------------------
 kdbx_rm_compute_metrics      - Compute Sharpe, CAGR, drawdown, vol for a symbol basket
 kdbx_rm_equity_curve_data    - Return cumulative return series (charting data)
 kdbx_rm_search_news          - Retrieve ranked news from KDB-X for a portfolio
+kdbx_rm_query_ohlcv          - Query raw OHLCV bars for a date range
+kdbx_rm_query_news           - Query recent news articles (unranked)
+kdbx_rm_run_cep              - Run CEP rules against current table state
+kdbx_rm_get_alerts           - Return open CEP alerts from the event log
 
 All financial computation is delegated to .rmag.* q functions.
 Python here handles only MCP serialisation and error wrapping.
@@ -17,32 +23,22 @@ Python here handles only MCP serialisation and error wrapping.
 import logging
 from typing import Any, Dict, List
 
-from mcp_server.utils.kdbx import get_kdb_connection
+from mcp_server.utils.kdbx import _q_rest, _q_syms, _to_rows
 
 logger = logging.getLogger(__name__)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _q(expr: str, *args):
-    """Execute a q expression and return the Python-converted result."""
-    conn = get_kdb_connection()
-    try:
-        result = conn(expr, *args) if args else conn(expr)
-        return result.py() if hasattr(result, "py") else result
-    except Exception as exc:
-        raise RuntimeError(f"q call failed: {expr[:80]!r} — {exc}") from exc
-
-
 def _ok(data: Any, message: str = "") -> Dict[str, Any]:
-    r = {"status": "success", "data": data}
+    r: Dict[str, Any] = {"status": "success", "data": data}
     if message:
         r["message"] = message
     return r
 
 
 def _err(message: str, details: str = "") -> Dict[str, Any]:
-    r = {"status": "error", "message": message}
+    r: Dict[str, Any] = {"status": "error", "message": message}
     if details:
         r["technical_details"] = details
     return r
@@ -50,59 +46,14 @@ def _err(message: str, details: str = "") -> Dict[str, Any]:
 
 # ── Tool implementations ──────────────────────────────────────────────────────
 
-async def _rm_ingest_ohlcv_impl(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Core logic for kdbx_rm_ingest_ohlcv."""
-    if not records:
-        return _ok({"inserted_count": 0}, "No records provided")
-
-    dates   = [r["date"]   for r in records]
-    syms    = [r["sym"]    for r in records]
-    opens   = [r["open"]   for r in records]
-    highs   = [r["high"]   for r in records]
-    lows    = [r["low"]    for r in records]
-    closes  = [r["close"]  for r in records]
-    volumes = [r["volume"] for r in records]
-
-    try:
-        n = _q(".rmag.ingestOhlcv", dates, syms, opens, highs, lows, closes, volumes)
-        logger.info("kdbx_rm_ingest_ohlcv: inserted %d records", n)
-        return _ok({"inserted_count": int(n)})
-    except Exception as exc:
-        logger.error("kdbx_rm_ingest_ohlcv: failed — %s", exc)
-        return _err("OHLCV ingestion failed", str(exc))
-
-
-async def _rm_ingest_news_impl(articles: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Core logic for kdbx_rm_ingest_news."""
-    if not articles:
-        return _ok({"inserted_count": 0}, "No articles provided")
-
-    titles    = [a.get("title", "")    for a in articles]
-    urls      = [a.get("url", "")      for a in articles]
-    sources   = [a.get("source", "")   for a in articles]
-    published = [a.get("time_published", "") for a in articles]
-    summaries = [a.get("summary", "")  for a in articles]
-    scores    = [float(a.get("sentiment_score", 0)) for a in articles]
-    labels    = [a.get("sentiment_label", "Neutral") for a in articles]
-    sym_strs  = ["|".join(a.get("relevant_symbols") or []) for a in articles]
-
-    try:
-        n = _q(".rmag.ingestNews", titles, urls, sources, published,
-               summaries, scores, labels, sym_strs)
-        logger.info("kdbx_rm_ingest_news: stored %d articles", n)
-        return _ok({"inserted_count": int(n)})
-    except Exception as exc:
-        logger.error("kdbx_rm_ingest_news: failed — %s", exc)
-        return _err("News ingestion failed", str(exc))
-
-
 async def _rm_compute_metrics_impl(
     symbols: List[str],
     lookback_days: int,
 ) -> Dict[str, Any]:
-    """Core logic for kdbx_rm_compute_metrics."""
+    syms_q = _q_syms(symbols)
+    expr = f".rmag.computeMetrics[{syms_q};{lookback_days}]"
     try:
-        result = _q(".rmag.computeMetrics", [s.upper() for s in symbols], lookback_days)
+        result = _q_rest(expr)
         logger.info("kdbx_rm_compute_metrics: computed metrics for %s", symbols)
         return _ok(result)
     except Exception as exc:
@@ -114,16 +65,11 @@ async def _rm_equity_curve_impl(
     symbols: List[str],
     lookback_days: int,
 ) -> Dict[str, Any]:
-    """Core logic for kdbx_rm_equity_curve_data."""
+    syms_q = _q_syms(symbols)
+    expr = f".rmag.equityCurveData[{syms_q};{lookback_days}]"
     try:
-        result = _q(".rmag.equityCurveData", [s.upper() for s in symbols], lookback_days)
-        # Convert table rows to list of dicts for JSON serialisation
-        if hasattr(result, "__iter__") and not isinstance(result, (dict, list, str)):
-            rows = [dict(row) for row in result]
-        elif isinstance(result, list):
-            rows = result
-        else:
-            rows = []
+        result = _q_rest(expr)
+        rows = _to_rows(result)
         logger.info("kdbx_rm_equity_curve_data: returned %d curve points", len(rows))
         return _ok(rows)
     except Exception as exc:
@@ -136,18 +82,12 @@ async def _rm_search_news_impl(
     query: str,
     limit: int,
 ) -> Dict[str, Any]:
-    """Core logic for kdbx_rm_search_news."""
+    syms_q = _q_syms(symbols)
+    safe_query = query.replace('"', '\\"')
+    expr = f'.rmag.searchNews[{syms_q};"{safe_query}";{limit}]'
     try:
-        result = _q(".rmag.searchNews",
-                    [s.upper() for s in symbols],
-                    query,
-                    limit)
-        if hasattr(result, "__iter__") and not isinstance(result, (dict, list, str)):
-            rows = [dict(row) for row in result]
-        elif isinstance(result, list):
-            rows = result
-        else:
-            rows = []
+        result = _q_rest(expr)
+        rows = _to_rows(result)
         logger.info("kdbx_rm_search_news: returned %d articles", len(rows))
         return _ok(rows)
     except Exception as exc:
@@ -161,38 +101,6 @@ def register_tools(mcp_server):
     """Register all RM agent MCP tools with the FastMCP server."""
 
     @mcp_server.tool()
-    async def kdbx_rm_ingest_ohlcv(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Store daily OHLCV records from AlphaVantage into KDB-X.
-
-        Called by the kdb-ai-demo-agent data_fetch_node immediately after
-        fetching from AlphaVantage. All downstream analytics read from KDB-X.
-
-        Args:
-            records: list of {date, sym, open, high, low, close, volume}
-                     as returned by AlphaVantageClient.get_daily_ohlcv().
-
-        Returns:
-            {status, data: {inserted_count}}
-        """
-        return await _rm_ingest_ohlcv_impl(records)
-
-    @mcp_server.tool()
-    async def kdbx_rm_ingest_news(articles: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Store news articles from AlphaVantage into KDB-X.
-
-        Stores news metadata in rmag_news table. When KDB.AI is enabled,
-        triggers vector embedding for semantic search via .rmag.ingestNews.
-
-        Args:
-            articles: list of {title, url, source, time_published, summary,
-                               sentiment_score, sentiment_label, relevant_symbols}
-
-        Returns:
-            {status, data: {inserted_count}}
-        """
-        return await _rm_ingest_news_impl(articles)
-
-    @mcp_server.tool()
     async def kdbx_rm_compute_metrics(
         symbols: List[str],
         lookback_days: int = 90,
@@ -200,7 +108,7 @@ def register_tools(mcp_server):
         """Compute portfolio performance metrics for a basket of symbols using q analytics.
 
         Delegates entirely to .rmag.computeMetrics in q — no Python computation.
-        Reads from rmag_ohlcv table ingested by kdbx_rm_ingest_ohlcv.
+        Reads from rmag_ohlcv table populated by the feed ingestion pipeline.
 
         Args:
             symbols:       Ticker symbols to analyse, e.g. ["AAPL", "MSFT", "TSM"]
@@ -241,12 +149,11 @@ def register_tools(mcp_server):
         """Retrieve ranked news articles from KDB-X for a portfolio.
 
         Calls .rmag.searchNews — q applies composite relevance scoring
-        (symbol match + recency + sentiment magnitude). When KDB.AI is
-        enabled, enhances with hybrid BM25 + vector ANN search.
+        (symbol match + recency + sentiment magnitude).
 
         Args:
             symbols: Ticker symbols to match news against
-            query:   Natural language query (used for KDB.AI semantic path)
+            query:   Natural language query string
             limit:   Maximum articles to return (default 10)
 
         Returns:
@@ -255,11 +162,121 @@ def register_tools(mcp_server):
         """
         return await _rm_search_news_impl(symbols, query, limit)
 
-    logger.info("kdbx_rm_agent: registered 5 RM agent tools")
+    @mcp_server.tool()
+    async def kdbx_rm_query_ohlcv(
+        symbols: List[str],
+        start_date: str,
+        end_date: str,
+    ) -> Dict[str, Any]:
+        """Query OHLCV bars from KDB-X for a symbol basket over a date range.
+
+        Returns raw price data for the requested symbols and date window.
+
+        Args:
+            symbols:    Tickers to include, e.g. ["AAPL", "MSFT"]. Empty = all symbols.
+            start_date: Start date inclusive, ISO format "YYYY-MM-DD"
+            end_date:   End date inclusive, ISO format "YYYY-MM-DD"
+
+        Returns:
+            {status, data: [{date, sym, open, high, low, close, vol}]}
+        """
+        syms_q = _q_syms(symbols)
+        expr = f'.rmag.queryOhlcv[{syms_q};"{start_date}";"{end_date}"]'
+        try:
+            result = _q_rest(expr)
+            rows = _to_rows(result)
+            logger.info("kdbx_rm_query_ohlcv: returned %d rows", len(rows))
+            return _ok(rows)
+        except Exception as exc:
+            logger.error("kdbx_rm_query_ohlcv: failed — %s", exc)
+            return _err("OHLCV query failed", str(exc))
+
+    @mcp_server.tool()
+    async def kdbx_rm_query_news(
+        symbols: List[str],
+        limit: int = 20,
+    ) -> Dict[str, Any]:
+        """Query recent news articles from KDB-X for a symbol basket.
+
+        Returns structured news data — newest first, no ranking applied.
+        For LLM-relevant ranked results use kdbx_rm_search_news instead.
+
+        Args:
+            symbols: Tickers to filter, e.g. ["AAPL"]. Empty = all symbols.
+            limit:   Maximum articles to return (default 20)
+
+        Returns:
+            {status, data: [{ts, sym, title, url, source, sentiment, sentLabel}]}
+        """
+        syms_q = _q_syms(symbols)
+        expr = f".rmag.queryNews[{syms_q};{limit}]"
+        try:
+            result = _q_rest(expr)
+            rows = _to_rows(result)
+            logger.info("kdbx_rm_query_news: returned %d articles", len(rows))
+            return _ok(rows)
+        except Exception as exc:
+            logger.error("kdbx_rm_query_news: failed — %s", exc)
+            return _err("News query failed", str(exc))
+
+    @mcp_server.tool()
+    async def kdbx_rm_run_cep() -> Dict[str, Any]:
+        """Run all CEP rules against current in-memory table state.
+
+        Evaluates all 5 rules (PRICE_ALERT, VOLUME_SPIKE, MOMENTUM_SIGNAL,
+        DRAWDOWN_ALERT, NEWS_ALERT) and appends any new alerts to the event log.
+
+        Call this after an ingestion cycle to trigger alert detection.
+        New alerts are retrievable via kdbx_rm_get_alerts.
+
+        Returns:
+            {status, data: {events_fired: N}}
+        """
+        try:
+            result = _q_rest(".rmag.runCep[]")
+            n = result if isinstance(result, int) else 0
+            logger.info("kdbx_rm_run_cep: %s new events fired", n)
+            return _ok({"events_fired": n})
+        except Exception as exc:
+            logger.error("kdbx_rm_run_cep: failed — %s", exc)
+            return _err("CEP evaluation failed", str(exc))
+
+    @mcp_server.tool()
+    async def kdbx_rm_get_alerts(
+        symbols: List[str],
+        window_minutes: int = 60,
+    ) -> Dict[str, Any]:
+        """Return open CEP alerts fired within the last N minutes.
+
+        Use this to check for recent market events after a CEP run.
+        In the trigger flow: ingest → kdbx_rm_run_cep → kdbx_rm_get_alerts
+        → if alerts exist, spawn agent research run.
+
+        Args:
+            symbols:        Filter by ticker. Empty = all symbols.
+            window_minutes: Lookback window in minutes (default 60)
+
+        Returns:
+            {status, data: [{evtId, ts, sym, evtType, severity, val, thrshVal, msg}]}
+        """
+        syms_q = _q_syms(symbols)
+        expr = f".rmag.getOpenAlerts[{syms_q};{window_minutes}]"
+        try:
+            result = _q_rest(expr)
+            rows = _to_rows(result)
+            logger.info("kdbx_rm_get_alerts: returned %d open alerts", len(rows))
+            return _ok(rows)
+        except Exception as exc:
+            logger.error("kdbx_rm_get_alerts: failed — %s", exc)
+            return _err("Alert query failed", str(exc))
+
+    logger.info("kdbx_rm_agent: registered 7 RM agent tools")
     return [
-        "kdbx_rm_ingest_ohlcv",
-        "kdbx_rm_ingest_news",
         "kdbx_rm_compute_metrics",
         "kdbx_rm_equity_curve_data",
         "kdbx_rm_search_news",
+        "kdbx_rm_query_ohlcv",
+        "kdbx_rm_query_news",
+        "kdbx_rm_run_cep",
+        "kdbx_rm_get_alerts",
     ]

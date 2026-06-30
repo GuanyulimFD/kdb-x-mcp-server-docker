@@ -1,47 +1,59 @@
 // ============================================================================
 // Module:      rm-agent
 // Namespace:   .rmag
-// Description: AI Relationship Manager analytics module.
+// Description: AI Relationship Manager — KDB-X data platform module.
 //
-//              DATA ARCHITECTURE — KDB-X DB Service
-//              ─────────────────────────────────────
-//              AlphaVantage Poller (Python)
-//                  │  polls REST API at configurable intervals
-//                  ▼
-//              rtpy.rt_helper.insert(h, table, rows)
-//                  │  Reliable Transport (RT) — port 5002
-//                  ▼
-//              DB Service Storage Manager (SM)
-//                  ├─ RDB  (in-memory — today's data)         DAP RDB port 5010
-//                  ├─ IDB  (intraday writedown — SM managed)
-//                  └─ HDB  (on-disk, partitioned by date)     DAP HDB port 5011
+//              DATA ARCHITECTURE — Standalone KDB-X (MCP server mode)
+//              ─────────────────────────────────────────────────────────
+//              Python Feed Services  (PyKX IPC — port 5001)
+//                  ingest_ohlcv.py  — asyncio timer, AlphaVantage → rmag_ohlcv
+//                  ingest_news.py   — news source (REST/WebSocket) → rmag_news
 //
-//              Tables (schema defined in DB Service, owned by SM):
+//              Tables (owned by this module in standalone mode):
 //                  rmag_ohlcv      — daily OHLCV bars (date, sym, open/high/low/close/vol)
-//                  rmag_quote      — live quotes      (ts, sym, price, change, volume)
-//                  rmag_intraday   — 1-min bars       (ts, sym, open/high/low/close/vol)
-//                  rmag_news       — news + sentiment (ts, sym, title, summary, sentiment)
+//                  rmag_quote      — live quote snapshot (ts, sym, price, changePct, volume)
+//                  rmag_intraday   — 1-min bars  (ts, sym, open/high/low/close/vol)
+//                  rmag_news       — news + sentiment (ts, sym, title, url, sentiment)
 //
-//              ANALYTICS (all in q — loaded into DB Service DAP at startup)
-//              ─────────────────────────────────────────────────────────────
-//              Python calls these via POST /api/v0/query/q from DB Service REST API.
-//              The DB Service Gateway routes the query to the correct DAP tier and
-//              automatically aggregates results across RDB + IDB + HDB.
+//              MODULES
+//              ───────
+//              Ingestion  : .rmag.ingestOhlcv | .rmag.ingestNews
+//              Analytics  : .rmag.computeMetrics | .rmag.equityCurveData
+//              Query      : .rmag.queryOhlcv | .rmag.queryNews | .rmag.searchNews
+//              CEP        : .rmag.runCep | .rmag.getEvents | .rmag.getOpenAlerts
 //
-//              .rmag.computeMetrics   — Sharpe, CAGR, max drawdown, ann. vol
-//              .rmag.equityCurveData  — cumulative return series for charting
-//              .rmag.searchNews       — composite relevance ranking
+//              Python MCP tools call these via pykx.SyncQConnection (port 5001).
+//              See src/mcp_server/tools/kdbx_rm_agent.py for MCP registrations.
 //
-//              DEPLOYMENT
-//              ──────────
-//              Clone github.com/KxSystems/kdbx-db-service and add this file
-//              to the DAP startup configuration (e.g. via KDBX_INIT_SCRIPT env var
-//              or by referencing it in the docker-compose .env).
-//
-// Version:     0.4.0
-// Requires:    KDB-X DB Service (preview) + KDB-X 5.0
+// Version:     0.5.0
+// Requires:    KDB-X 5.0
 // Author:      kdb-ai-demo-agent
 // ============================================================================
+
+// ── Standalone mode: initialise tables in .rmag namespace ────────────────────
+// Tables live in .rmag namespace so all functions in that namespace find them
+// via direct local lookup. Variable-based operations (,:) respect namespace;
+// symbol-based upsert (`name) is AVOIDED in favour of direct append.
+//
+// In DB Service mode the SM owns the tables — the `if not` guards prevent
+// overwriting SM-managed tables (which land in the same .rmag namespace).
+
+if[not `rmag_ohlcv in key `.rmag;
+    .rmag.rmag_ohlcv:([]date:`date$();sym:`$();open:`float$();high:`float$();low:`float$();close:`float$();vol:`long$())]
+
+if[not `rmag_quote in key `.rmag;
+    .rmag.rmag_quote:([]ts:`timestamp$();sym:`$();price:`float$();change:`float$();changePct:`float$();volume:`long$();high:`float$();low:`float$();open:`float$())]
+
+if[not `rmag_intraday in key `.rmag;
+    .rmag.rmag_intraday:([]ts:`timestamp$();sym:`$();open:`float$();high:`float$();low:`float$();close:`float$();vol:`long$())]
+
+if[not `rmag_news in key `.rmag;
+    .rmag.rmag_news:([]ts:`timestamp$();sym:`$();title:`$();url:`$();source:`$();published:`$();summary:`$();sentiment:`float$();sentLabel:`$())]
+
+// ── Load CEP engine if not already present ──────────────────────────────────
+// kdbx_init.q loads only <dir>/<dir>.q; cep-engine.q is loaded explicitly here.
+
+if[not `.cep in key `.; system "l q-modules/rm-agent/cep-engine.q"]
 
 \d .rmag
 
@@ -74,8 +86,8 @@ computeMetrics:{[syms;lookbackDays]
     cutoff: .z.d - lookbackDays;
     ann:    252f;
 
-    calcOne_:{[sym;cutoff;ann]
-        prices: exec close from rmag_ohlcv where sym=sym, date>=cutoff;
+    calcOne_:{[s;cutoff;ann]
+        prices: exec close from rmag_ohlcv where sym=s, date>=cutoff;
         prices: prices where not null prices;
         if[2>count prices; :()];
 
@@ -159,6 +171,113 @@ searchNews:{[syms;query;limit]
     limit # delete score from ranked
     }
 
+// ── Ingestion (called by Python feed services via PyKX IPC) ─────────────────
+
+/ @desc  Append daily OHLCV rows into rmag_ohlcv.
+/        Called by ingest_ohlcv.py after each AlphaVantage poll cycle.
+/ @param dates   {date[]}   Trading dates
+/ @param syms    {symbol[]} Ticker symbols
+/ @param opens   {float[]}  Opening prices
+/ @param highs   {float[]}  Session highs
+/ @param lows    {float[]}  Session lows
+/ @param closes  {float[]}  Closing prices
+/ @param volumes {long[]}   Traded volumes
+/ @return {long} Row count appended
+/ @example .rmag.ingestOhlcv[2024.01.15 2024.01.15; `AAPL`MSFT; 182.0 370.0; 185.0 375.0; 181.0 368.0; 184.0 373.0; 1000000j 500000j]
+ingestOhlcv:{[dates;syms;opens;highs;lows;closes;volumes]
+    rows:([]date:dates;sym:syms;open:opens;high:highs;low:lows;close:closes;vol:volumes);
+    n:count rows;
+    require_[0<n; `$"ingestOhlcv: no rows to insert"];
+    rmag_ohlcv,:rows;
+    logI_ "ingestOhlcv: appended ",string[n]," rows (total: ",string[count rmag_ohlcv],")";
+    n
+    }
+
+/ @desc  Append news articles into rmag_news.
+/        Called by ingest_news.py after each poll or WebSocket batch.
+/ @param titles    {symbol[]} Article headlines
+/ @param urls      {symbol[]} Source URLs
+/ @param sources   {symbol[]} Publisher names
+/ @param published {symbol[]} Publication timestamps (ISO string from provider)
+/ @param summaries {symbol[]} Article lead paragraphs
+/ @param scores    {float[]}  NLP sentiment in [-1.0, 1.0]
+/ @param labels    {symbol[]} Sentiment labels (Positive|Neutral|Negative)
+/ @param symStrs   {symbol[]} Primary ticker as symbol (one per article)
+/ @return {long} Article count appended
+/ @example .rmag.ingestNews[(`$enlist "Headline"); (`$enlist "https://..."); (`$enlist "Reuters"); (`$enlist "2024-01-15"); (`$enlist "Summary"); enlist 0.6; (`$enlist "Positive"); (`$enlist "AAPL")]
+ingestNews:{[titles;urls;sources;published;summaries;scores;labels;symStrs]
+    n:count titles;
+    require_[0<n; `$"ingestNews: no articles to insert"];
+    rows:([]ts:n#.z.p;sym:`$symStrs;title:`$titles;url:`$urls;
+           source:`$sources;published:`$published;summary:`$summaries;
+           sentiment:scores;sentLabel:`$labels);
+    rmag_news,:rows;
+    logI_ "ingestNews: appended ",string[n]," articles (total: ",string[count rmag_news],")";
+    n
+    }
+
+// ── Structured queries (API-driven — called by Python MCP query tools) ───────
+
+/ @desc  Query OHLCV bars for a symbol basket over a date range.
+/        Returns all symbols when syms is empty.
+/ @param syms      {symbol[]} Tickers; () = all symbols
+/ @param startDate {date}     Start date (inclusive)
+/ @param endDate   {date}     End date (inclusive)
+/ @return {table} Columns: date sym open high low close vol; sorted by date asc, sym asc
+/ @example .rmag.queryOhlcv[`AAPL`MSFT; 2024.01.01; 2024.03.31]
+queryOhlcv:{[syms;startDate;endDate]
+    if[0=count rmag_ohlcv;
+        logW_ "queryOhlcv: rmag_ohlcv is empty — ingest data first";
+        :([]date:`date$();sym:`$();open:`float$();high:`float$();low:`float$();close:`float$();vol:`long$())];
+    logI_ "queryOhlcv: syms=",($[0=count syms;"*";" " sv string syms])," ",string[startDate]," to ",string[endDate];
+    q:$[0=count syms;
+        select date,sym,open,high,low,close,vol from rmag_ohlcv where date within (startDate;endDate);
+        select date,sym,open,high,low,close,vol from rmag_ohlcv where sym in syms, date within (startDate;endDate)
+    ];
+    `date`sym xasc q
+    }
+
+/ @desc  Query recent news articles for a symbol basket, newest first.
+/        Returns all symbols when syms is empty.
+/ @param syms  {symbol[]} Tickers; () = all symbols
+/ @param limit {long}     Maximum articles to return
+/ @return {table} Columns: ts sym title url source sentiment sentLabel; newest first
+/ @example .rmag.queryNews[`AAPL; 20]
+queryNews:{[syms;limit]
+    if[0=count rmag_news;
+        logW_ "queryNews: rmag_news is empty — ingest news first";
+        :([]ts:`timestamp$();sym:`$();title:`$();url:`$();source:`$();sentiment:`float$();sentLabel:`$())];
+    logI_ "queryNews: syms=",($[0=count syms;"*";" " sv string syms])," limit=",string limit;
+    q:$[0=count syms;
+        select ts,sym,title,url,source,sentiment,sentLabel from rmag_news;
+        select ts,sym,title,url,source,sentiment,sentLabel from rmag_news where sym in syms
+    ];
+    limit # `ts xdesc q
+    }
+
+// ── CEP runner (pipes current table state through cep-engine rules) ──────────
+
+/ @desc  Run all CEP rules against the current in-memory table state.
+/        Alerts are appended to .cep.rmag_events.
+/        Call this after each ingestion cycle or from a scheduled timer.
+/ @return {long} Total new events fired across all 5 rules
+/ @example .rmag.runCep[]
+runCep:{
+    require_[0<count key `.cep; `$"runCep: cep-engine.q not loaded"];
+    qData:$[0<count rmag_quote;
+        select from rmag_quote;
+        ([]ts:`timestamp$();sym:`$();changePct:`float$();volume:`long$())];
+    oData:$[0<count rmag_ohlcv;
+        select from rmag_ohlcv;
+        ([]date:`date$();sym:`$();close:`float$())];
+    nData:$[0<count rmag_news;
+        select from rmag_news;
+        ([]ts:`timestamp$();sym:`$();sentiment:`float$())];
+    n:.cep.runRules[qData;oData;nData];
+    logI_ "runCep: ",string[n]," new event(s) fired";
+    n
+    }
+
 // ── CEP event log API (delegates to .cep.* — requires cep-engine.q loaded) ──
 
 // @desc  Query the CEP event log with optional sym/evtType filters and row limit.
@@ -187,9 +306,10 @@ getOpenAlerts:{[syms;windowMins]
 // ── Module load banner ───────────────────────────────────────────────────────
 
 \d .
--1 "[rmag] v0.4.0 loaded — DB Service analytics module";
--1 "[rmag] Analytics : .rmag.computeMetrics | .rmag.equityCurveData | .rmag.searchNews";
--1 "[rmag] CEP API   : .rmag.getEvents | .rmag.getOpenAlerts (delegates to .cep.*)";
--1 "[rmag] Data tier : rmag_ohlcv | rmag_news | rmag_quote | rmag_intraday (owned by DB Service SM)";
--1 "[rmag] Interface : query via POST /api/v0/query/q on DB Service Gateway";
+-1 "[rmag] v0.5.0 loaded — standalone KDB-X analytics module";
+-1 "[rmag] Ingest    : .rmag.ingestOhlcv | .rmag.ingestNews";
+-1 "[rmag] Analytics : .rmag.computeMetrics | .rmag.equityCurveData";
+-1 "[rmag] Query     : .rmag.queryOhlcv | .rmag.queryNews | .rmag.searchNews";
+-1 "[rmag] CEP       : .rmag.runCep | .rmag.getEvents | .rmag.getOpenAlerts";
+-1 "[rmag] Tables    : rmag_ohlcv | rmag_quote | rmag_intraday | rmag_news (in-memory)";
 

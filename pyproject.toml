@@ -9,6 +9,8 @@ dependencies = [
     "pykx>=4.0.0.b4",
     "pydantic-settings",
     "packaging",
+    # DB Service Gateway REST client (replaces PyKX IPC for rm-agent tools)
+    "httpx>=0.27.0",
     # Optional: Manage below packages for embedding support
     # "sentence_transformers",
     # "openai",

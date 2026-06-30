@@ -66,6 +66,10 @@ class KDBConfig(BaseSettings):
             "[env: KDBX_DB_QCUMBER_PATH]"
         )
     )
+    service_url: str = Field(
+        default="http://localhost:8080",
+        description="KxSystems DB Service Gateway REST base URL [env: KDBX_DB_SERVICE_URL]"
+    )
 
 
 
