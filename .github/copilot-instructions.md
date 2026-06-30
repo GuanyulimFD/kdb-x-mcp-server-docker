@@ -701,6 +701,8 @@ Three agent skills are available in `.github/skills/`. Each is loaded **on deman
 | **KDB Business Analyst** | `.github/skills/kdb-business-analyst/` | Gathering business requirements; writing BDD specifications; creating or reviewing JIRA tickets for trade P&L, client profile, or trading behaviour features. **Never infers — always asks.** |
 | **KDB Developer** | `.github/skills/kdb-developer/` | Implementing q modules; testing q syntax via `kdbx_q_eval`; writing qcumber test suites from BDD specs in a separate session. |
 | **KDB Doc & Review** | `.github/skills/kdb-doc-review/` | Reviewing documentation completeness; auditing knowledge drift across BDD spec / module / quke tests / README; expert KDB code review; drafting Confluence pages. |
+| **MD → PPTX** | `.github/skills/md-to-pptx/` | Converting Markdown files into corporate PowerPoint decks (client pitches, internal training, project showcases) using the First Derivative visual language. |
+| **MD → DOCX** | `.github/skills/md-to-docx/` | Converting Markdown files into corporate Word documents: Client Proposal, Client Overview, Internal Guide, Whitepaper, or Blog — each with its own tone, structure, and FD brand styling. |
 
 ### Skill Workflow (summary)
 
@@ -740,6 +742,8 @@ Topic files should use VS Code's
 | JIRA memory file (handover record) | BA skill auto-creates `.memory/jira/<TICKET-ID>.md`; see template at `.memory/template/JIRA-TEMPLATE.md` |
 | Implement a new q module | Use the `kdb-developer` skill |
 | Review docs / code quality / knowledge drift | Use the `kdb-doc-review` skill |
+| Convert Markdown to corporate PPTX | Use the `md-to-pptx` skill |
+| Convert Markdown to corporate DOCX | Use the `md-to-docx` skill |
 | qcumber test reference | <https://code.kx.com/developer/qcumber/> |
 | New MCP tool | Create `src/mcp_server/tools/kdbx_<name>.py`, register in `__init__.py` |
 | Prototype q logic | Call `kdbx_q_eval` tool interactively |
