@@ -2,9 +2,10 @@
 Unit tests for kdbx_q_lint helpers and tool.
 No live KDB-X connection required — all pykx calls are mocked.
 """
+import asyncio
 import json
 import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, AsyncMock, patch, call
 
 
 # ---------------------------------------------------------------------------
@@ -219,3 +220,15 @@ class TestQLintImpl:
                 await q_lint_impl("item", "1+1")
                 await q_lint_impl("item", "1+2")
         assert mock_ensure.call_count == 2
+
+    async def test_timeout_returns_error(self):
+        """Timeout must return status=error with the exact spec message."""
+        from mcp_server.tools.kdbx_q_analytics import q_lint_impl
+        conn = _mock_lint_conn()
+        with patch("mcp_server.tools.kdbx_q_analytics.get_kdb_connection", return_value=conn):
+            with patch("mcp_server.tools.kdbx_q_analytics._ensure_qlint_loaded"):
+                with patch("mcp_server.tools.kdbx_q_analytics.asyncio.wait_for",
+                           new=AsyncMock(side_effect=asyncio.TimeoutError)):
+                    result = await q_lint_impl("item", "f:{x}", timeout=1)
+        assert result["status"] == "error"
+        assert "qlint timed out after 1s" in result["message"]

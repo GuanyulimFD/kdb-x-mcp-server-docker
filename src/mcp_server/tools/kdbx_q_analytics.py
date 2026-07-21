@@ -1,3 +1,4 @@
+import asyncio
 import glob
 import logging
 import json
@@ -120,16 +121,15 @@ def _find_qcumber() -> str:
 
 
 _QLINT_NOT_FOUND_MSG = (
-    "qlint.q_ not found. It is bundled with KX Developer (KX Analyst).\n"
+    "qlint.q_ not found. It is bundled with KX Developer.\n"
     "\n"
-    "  Quickest fix — run the bundled install script to vendor ax-libraries:\n"
-    "    ./scripts/install_ax_libraries.sh [/path/to/developer-<ver>-<os>]\n"
+    "  qlint.q_ lives inside analyst/ws/ within the KX Developer install\n"
+    "  (not in ax-libraries — install_ax_libraries.sh will NOT provide it).\n"
     "\n"
-    "  Download KX Developer from: https://code.kx.com/developer/getting-started/\n"
+    "  Quickest fix — set the path explicitly:\n"
+    "    KDBX_DB_QLINT_PATH=/path/to/developer-<ver>-<os>/analyst/ws/qlint.q_\n"
     "\n"
-    "  After downloading, you can also set:\n"
-    "    • KDBX_DB_QLINT_PATH=/path/to/developer-<ver>-<os>/analyst/ws/qlint.q_\n"
-    "  Or pass qlint_path directly in the tool call."
+    "  Download KX Developer from: https://code.kx.com/developer/getting-started/"
 )
 
 
@@ -138,37 +138,28 @@ def _find_qlint() -> str:
 
     Search order:
       1. Explicit KDBX_DB_QLINT_PATH setting / env var
-      2. vendor/ax-libraries/ws/qlint.q_   (project-local)
-      3. ~/.kx/ax-libraries/ws/qlint.q_    (standard KX tooling home)
-      4. AXLIBRARIES_HOME/ws/qlint.q_      (explicit env override)
-      5. ~/developer-*/analyst/ws/qlint.q_ (KX Developer install glob)
+      2. ~/.kx/ax-libraries/ws/qlint.q_    (standard KX tooling home)
+      3. AXLIBRARIES_HOME/ws/qlint.q_      (explicit env override)
+      4. ~/developer-*/analyst/ws/qlint.q_ (KX Developer install glob)
     """
     # 1. Explicit setting
     configured = app_settings.db.qlint_path
     if configured and os.path.isfile(configured):
         return configured
 
-    # 2. Project-local vendor
-    _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__)
-    ))))
-    vendor_candidate = os.path.join(_project_root, "vendor", "ax-libraries", "ws", "qlint.q_")
-    if os.path.isfile(vendor_candidate):
-        return vendor_candidate
-
-    # 3. Standard KX tooling home
+    # 2. Standard KX tooling home
     kx_candidate = os.path.join(os.path.expanduser("~"), ".kx", "ax-libraries", "ws", "qlint.q_")
     if os.path.isfile(kx_candidate):
         return kx_candidate
 
-    # 4. AXLIBRARIES_HOME
+    # 3. AXLIBRARIES_HOME
     ax = os.environ.get("AXLIBRARIES_HOME", "")
     if ax:
         candidate = os.path.join(ax, "ws", "qlint.q_")
         if os.path.isfile(candidate):
             return candidate
 
-    # 5. KX Developer install — qlint.q_ lives in analyst/ws/ only
+    # 4. KX Developer install — qlint.q_ lives in analyst/ws/ only
     for pattern in [
         os.path.expanduser("~/developer-*/analyst/ws/qlint.q_"),
         os.path.expanduser("~/developer-*-osx/analyst/ws/qlint.q_"),
@@ -555,11 +546,21 @@ async def q_lint_impl(
 
         arg = code_or_path.encode()
         if mode == "item":
-            raw = conn("{.j.j .qlint.lintItem[x; ::]}", arg)
+            q_call = lambda: conn("{.j.j .qlint.lintItem[x; ::]}", arg)
         elif mode == "file":
-            raw = conn("{.j.j .qlint.lintFile[x]}", arg)
+            q_call = lambda: conn("{.j.j .qlint.lintFile[x]}", arg)
         else:
-            raw = conn("{.j.j .qlint.lintFolder[x]}", arg)
+            q_call = lambda: conn("{.j.j .qlint.lintFolder[x]}", arg)
+
+        try:
+            raw = await asyncio.wait_for(
+                asyncio.to_thread(q_call),
+                timeout=float(timeout),
+            )
+        except asyncio.TimeoutError:
+            elapsed = time.perf_counter() - t0
+            logger.warning(f"kdbx_q_lint: timed out after {elapsed:.3f}s (limit={timeout}s)")
+            return {"status": "error", "message": f"qlint timed out after {timeout}s"}
 
         elapsed = time.perf_counter() - t0
 
