@@ -175,29 +175,6 @@ def _find_qlint() -> str:
     return ""
 
 
-def _ensure_qlint_loaded(conn) -> None:
-    """Load qlint.q_ into the q session if not already present.
-
-    Checks for the .qlint namespace in the connected q session. If absent,
-    changes q's working directory to analyst/ws/ (so relative deps resolve)
-    and loads qlint.q_.
-
-    Raises RuntimeError if qlint.q_ cannot be located.
-    """
-    already = conn("{@[{key .qlint; 1b}; (::); {0b}]}")
-    if hasattr(already, "py"):
-        already = already.py()
-    if already:
-        return
-
-    qlint_path = _find_qlint()
-    if not qlint_path:
-        raise RuntimeError(_QLINT_NOT_FOUND_MSG)
-
-    analyst_ws = os.path.dirname(qlint_path)
-    conn(f"\\cd {analyst_ws}")
-    conn("\\l qlint.q_")
-
 
 def _get_q_arch_prefix() -> list:
     """
@@ -529,9 +506,14 @@ async def q_lint_impl(
     code_or_path: str,
     timeout: int = 30,
 ) -> Dict[str, Any]:
-    """Lint q code or a file/folder via qlint.q_ loaded into the q session."""
+    """Lint q code or a file/folder via qlint.q_ run as an x86_64 subprocess.
+
+    qlint.q_ depends on native x86_64 .so files (q_pcre.so) in analyst/ws/lib/.
+    It must run in a separate q process (not loaded into the live IPC session)
+    so that _get_q_arch_prefix() can force Rosetta 2 on arm64 macOS.
+    """
     _preview = code_or_path[:200] + ("..." if len(code_or_path) > 200 else "")
-    logger.info(f"kdbx_q_lint: mode={mode!r} | input={_preview!r}")
+    logger.info(f"kdbx_q_lint: mode={mode!r} | input={_preview!r} | timeout={timeout}s")
     t0 = time.perf_counter()
 
     if mode not in ("item", "file", "folder"):
@@ -540,47 +522,118 @@ async def q_lint_impl(
             "message": f"Invalid mode {mode!r}. Must be 'item', 'file', or 'folder'.",
         }
 
+    q_bin = _find_q_binary()
+    if not q_bin:
+        logger.error("kdbx_q_lint: cannot locate q binary")
+        return {
+            "status": "error",
+            "message": "Cannot locate q binary. Set Q_BINARY or ensure ~/.kx/bin/q exists.",
+        }
+
+    qlint_path = _find_qlint()
+    if not qlint_path:
+        logger.error("kdbx_q_lint: qlint.q_ not found")
+        return {"status": "error", "message": _QLINT_NOT_FOUND_MSG}
+
+    analyst_ws = os.path.dirname(qlint_path)   # cwd — so \l qlint.q_ resolves relative deps
+    lib_dir = os.path.join(analyst_ws, "lib")   # analyst/ws/lib/ — q_pcre.so lives here
+
+    arch_prefix = _get_q_arch_prefix()
+
+    if platform.system() == "Darwin":
+        extra_lib_env = {
+            "DYLD_LIBRARY_PATH": os.pathsep.join(filter(None, [
+                lib_dir,
+                os.environ.get("DYLD_LIBRARY_PATH", ""),
+            ])),
+        }
+    else:
+        extra_lib_env = {
+            "LD_LIBRARY_PATH": os.pathsep.join(filter(None, [
+                lib_dir,
+                os.environ.get("LD_LIBRARY_PATH", ""),
+            ])),
+        }
+
+    env = {
+        **os.environ,
+        "QLIC": os.environ.get("QLIC", os.path.expanduser("~/.kx")),
+        **extra_lib_env,
+    }
+
+    tmpdir = tempfile.mkdtemp(prefix="kdbx_qlint_")
     try:
-        conn = get_kdb_connection()
-        _ensure_qlint_loaded(conn)
+        input_file  = os.path.join(tmpdir, "lint_input.txt")
+        runner_file = os.path.join(tmpdir, "lint_runner.q")
 
-        arg = code_or_path.encode()
+        with open(input_file, "w") as f:
+            f.write(code_or_path)
+
+        # Runner q script: cwd is analyst/ws/ so \l qlint.q_ resolves relative deps.
+        # Input is read from a temp file (no q-string escaping needed for user content).
         if mode == "item":
-            q_call = lambda: conn("{.j.j .qlint.lintItem[x; ::]}", arg)
+            read_inp = f'inp:"\\n" sv read0 hsym `$"{input_file}"'
+            lint_call = "res:.qlint.lintItem[inp; ::]"
         elif mode == "file":
-            q_call = lambda: conn("{.j.j .qlint.lintFile[x]}", arg)
+            read_inp = f'inp:first read0 hsym `$"{input_file}"'
+            lint_call = "res:.qlint.lintFile[inp]"
         else:
-            q_call = lambda: conn("{.j.j .qlint.lintFolder[x]}", arg)
+            read_inp = f'inp:first read0 hsym `$"{input_file}"'
+            lint_call = "res:.qlint.lintFolder[inp]"
 
-        try:
-            raw = await asyncio.wait_for(
-                asyncio.to_thread(q_call),
-                timeout=float(timeout),
-            )
-        except asyncio.TimeoutError:
-            elapsed = time.perf_counter() - t0
-            logger.warning(f"kdbx_q_lint: timed out after {elapsed:.3f}s (limit={timeout}s)")
-            return {"status": "error", "message": f"qlint timed out after {timeout}s"}
+        runner_q = (
+            "\\l qlint.q_\n"
+            f"{read_inp}\n"
+            f"{lint_call}\n"
+            "-1 .j.j res;\n"
+            "\\\\\n"
+        )
+        with open(runner_file, "w") as f:
+            f.write(runner_q)
 
+        cmd = arch_prefix + [q_bin, runner_file, "-q"]
+        logger.info(f"kdbx_q_lint: cmd={' '.join(cmd)!r} | cwd={analyst_ws!r}")
+
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+            cwd=analyst_ws,
+            stdin=subprocess.DEVNULL,
+        )
         elapsed = time.perf_counter() - t0
 
-        if hasattr(raw, "py"):
-            raw = raw.py()
-        if isinstance(raw, (bytes, bytearray)):
-            raw = raw.decode("utf-8")
+        logger.debug(
+            f"kdbx_q_lint: subprocess exited | returncode={proc.returncode}"
+            f" | elapsed={elapsed:.3f}s"
+        )
+        if proc.stderr.strip():
+            logger.debug(f"kdbx_q_lint: stderr={proc.stderr.strip()!r}")
 
+        if proc.returncode != 0:
+            logger.error(
+                f"kdbx_q_lint: q exited with code {proc.returncode}"
+                f" | stderr={proc.stderr.strip()!r}"
+            )
+            return {
+                "status": "error",
+                "message": proc.stderr.strip() or f"q exited with code {proc.returncode}",
+            }
+
+        stdout = proc.stdout.strip()
         try:
-            violations_raw = json.loads(raw) if isinstance(raw, str) else raw
-        except Exception:
-            violations_raw = []
+            violations_raw = json.loads(stdout) if stdout else []
+        except json.JSONDecodeError as exc:
+            logger.error(f"kdbx_q_lint: failed to parse stdout as JSON | stdout={stdout!r} | error={exc}")
+            return {"status": "error", "message": f"Failed to parse linter output: {exc}"}
 
         if not isinstance(violations_raw, list):
             violations_raw = []
 
         def _s(v):
-            if isinstance(v, (bytes, bytearray)):
-                return v.decode("utf-8")
-            return v if v is not None else ""
+            return v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else (v if v is not None else "")
 
         violations = [
             {
@@ -609,12 +662,16 @@ async def q_lint_impl(
             "violations": violations,
         }
 
-    except RuntimeError as e:
-        return {"status": "error", "message": str(e)}
+    except subprocess.TimeoutExpired:
+        elapsed = time.perf_counter() - t0
+        logger.error(f"kdbx_q_lint: timed out after {elapsed:.3f}s (limit={timeout}s)")
+        return {"status": "error", "message": f"qlint timed out after {timeout}s"}
     except Exception as e:
         elapsed = time.perf_counter() - t0
         logger.error(f"kdbx_q_lint: exception after {elapsed:.3f}s | error={e!r}")
         return {"status": "error", "message": str(e)}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

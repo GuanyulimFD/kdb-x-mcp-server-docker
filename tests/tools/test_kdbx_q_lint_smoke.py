@@ -21,7 +21,8 @@ pytestmark = pytest.mark.live_kdb
 # Fixtures
 # ---------------------------------------------------------------------------
 
-CLEAN_CODE = "double:{[x] x*2}"
+# Inline call — no unused variables, genuinely clean
+CLEAN_CODE = "{[x;y] x+y}[1;2]"
 
 # UNUSED_PARAM: y declared but never referenced
 BAD_CODE = "add:{[x;y] x+x}"
