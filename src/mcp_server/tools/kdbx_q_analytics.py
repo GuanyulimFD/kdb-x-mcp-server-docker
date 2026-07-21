@@ -119,6 +119,95 @@ def _find_qcumber() -> str:
     return ""
 
 
+_QLINT_NOT_FOUND_MSG = (
+    "qlint.q_ not found. It is bundled with KX Developer (KX Analyst).\n"
+    "\n"
+    "  Quickest fix — run the bundled install script to vendor ax-libraries:\n"
+    "    ./scripts/install_ax_libraries.sh [/path/to/developer-<ver>-<os>]\n"
+    "\n"
+    "  Download KX Developer from: https://code.kx.com/developer/getting-started/\n"
+    "\n"
+    "  After downloading, you can also set:\n"
+    "    • KDBX_DB_QLINT_PATH=/path/to/developer-<ver>-<os>/analyst/ws/qlint.q_\n"
+    "  Or pass qlint_path directly in the tool call."
+)
+
+
+def _find_qlint() -> str:
+    """Locate qlint.q_ from settings, env vars, or the KX Developer install glob.
+
+    Search order:
+      1. Explicit KDBX_DB_QLINT_PATH setting / env var
+      2. vendor/ax-libraries/ws/qlint.q_   (project-local)
+      3. ~/.kx/ax-libraries/ws/qlint.q_    (standard KX tooling home)
+      4. AXLIBRARIES_HOME/ws/qlint.q_      (explicit env override)
+      5. ~/developer-*/analyst/ws/qlint.q_ (KX Developer install glob)
+    """
+    # 1. Explicit setting
+    configured = app_settings.db.qlint_path
+    if configured and os.path.isfile(configured):
+        return configured
+
+    # 2. Project-local vendor
+    _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)
+    ))))
+    vendor_candidate = os.path.join(_project_root, "vendor", "ax-libraries", "ws", "qlint.q_")
+    if os.path.isfile(vendor_candidate):
+        return vendor_candidate
+
+    # 3. Standard KX tooling home
+    kx_candidate = os.path.join(os.path.expanduser("~"), ".kx", "ax-libraries", "ws", "qlint.q_")
+    if os.path.isfile(kx_candidate):
+        return kx_candidate
+
+    # 4. AXLIBRARIES_HOME
+    ax = os.environ.get("AXLIBRARIES_HOME", "")
+    if ax:
+        candidate = os.path.join(ax, "ws", "qlint.q_")
+        if os.path.isfile(candidate):
+            return candidate
+
+    # 5. KX Developer install — qlint.q_ lives in analyst/ws/ only
+    for pattern in [
+        os.path.expanduser("~/developer-*/analyst/ws/qlint.q_"),
+        os.path.expanduser("~/developer-*-osx/analyst/ws/qlint.q_"),
+        os.path.expanduser("~/developer-*-linux/analyst/ws/qlint.q_"),
+        os.path.expanduser("~/.kx/developer-*/analyst/ws/qlint.q_"),
+        "/opt/developer/analyst/ws/qlint.q_",
+        "/usr/local/developer/analyst/ws/qlint.q_",
+    ]:
+        matches = sorted(glob.glob(pattern), reverse=True)
+        if matches:
+            return matches[0]
+
+    return ""
+
+
+def _ensure_qlint_loaded(conn) -> None:
+    """Load qlint.q_ into the q session if not already present.
+
+    Checks for the .qlint namespace in the connected q session. If absent,
+    changes q's working directory to analyst/ws/ (so relative deps resolve)
+    and loads qlint.q_.
+
+    Raises RuntimeError if qlint.q_ cannot be located.
+    """
+    already = conn("{@[{key .qlint; 1b}; (::); {0b}]}")
+    if hasattr(already, "py"):
+        already = already.py()
+    if already:
+        return
+
+    qlint_path = _find_qlint()
+    if not qlint_path:
+        raise RuntimeError(_QLINT_NOT_FOUND_MSG)
+
+    analyst_ws = os.path.dirname(qlint_path)
+    conn(f"\\cd {analyst_ws}")
+    conn("\\l qlint.q_")
+
+
 def _get_q_arch_prefix() -> list:
     """
     On arm64 macOS the ax-libraries native .so files are x86_64 only.
