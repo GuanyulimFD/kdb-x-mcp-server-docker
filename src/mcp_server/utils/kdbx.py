@@ -8,6 +8,7 @@ from mcp_server.server import app_settings
 db_config = app_settings.db
 logger = logging.getLogger(__name__)
 
+
 def get_kdb_connection() -> kx.QConnection:
 
     try:

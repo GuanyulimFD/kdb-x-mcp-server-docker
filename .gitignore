@@ -26,3 +26,8 @@ vendor/ax-libraries.zip
 .memory/
 research/
 memos/
+sdlc/
+kdb-x-mcp-server.code-workspace
+.github/skills/anthropics_skills
+.github/skills/md-to-docx/SKILL.md
+.github/skills/md-to-pptx/SKILL.md
