@@ -66,6 +66,15 @@ class KDBConfig(BaseSettings):
             "[env: KDBX_DB_QCUMBER_PATH]"
         )
     )
+    qlint_path: str = Field(
+        default="",
+        description=(
+            "Absolute path to qlint.q_ from KX Developer analyst/ws/. "
+            "If unset, the server globs ~/developer-*/analyst/ws/qlint.q_. "
+            "Download KX Developer from https://code.kx.com/developer/getting-started/ "
+            "[env: KDBX_DB_QLINT_PATH]"
+        )
+    )
 
 
 
