@@ -530,6 +530,93 @@ async def q_unit_test_impl(
 
 
 # ---------------------------------------------------------------------------
+# kdbx_q_lint  (qlint.q_-backed)
+# ---------------------------------------------------------------------------
+
+async def q_lint_impl(
+    mode: str,
+    code_or_path: str,
+    timeout: int = 30,
+) -> Dict[str, Any]:
+    """Lint q code or a file/folder via qlint.q_ loaded into the q session."""
+    _preview = code_or_path[:200] + ("..." if len(code_or_path) > 200 else "")
+    logger.info(f"kdbx_q_lint: mode={mode!r} | input={_preview!r}")
+    t0 = time.perf_counter()
+
+    if mode not in ("item", "file", "folder"):
+        return {
+            "status": "error",
+            "message": f"Invalid mode {mode!r}. Must be 'item', 'file', or 'folder'.",
+        }
+
+    try:
+        conn = get_kdb_connection()
+        _ensure_qlint_loaded(conn)
+
+        arg = code_or_path.encode()
+        if mode == "item":
+            raw = conn("{.j.j .qlint.lintItem[x; ::]}", arg)
+        elif mode == "file":
+            raw = conn("{.j.j .qlint.lintFile[x]}", arg)
+        else:
+            raw = conn("{.j.j .qlint.lintFolder[x]}", arg)
+
+        elapsed = time.perf_counter() - t0
+
+        if hasattr(raw, "py"):
+            raw = raw.py()
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8")
+
+        try:
+            violations_raw = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            violations_raw = []
+
+        if not isinstance(violations_raw, list):
+            violations_raw = []
+
+        def _s(v):
+            if isinstance(v, (bytes, bytearray)):
+                return v.decode("utf-8")
+            return v if v is not None else ""
+
+        violations = [
+            {
+                "label":        _s(row.get("label", "")),
+                "errorClass":   _s(row.get("errorClass", "")),
+                "description":  _s(row.get("description", "")),
+                "problemText":  _s(row.get("problemText", "")),
+                "errorMessage": _s(row.get("errorMessage", "")),
+                "startLine":    row.get("startLine", 0),
+                "startCol":     row.get("startCol", 0),
+                "endLine":      row.get("endLine", 0),
+                "endCol":       row.get("endCol", 0),
+            }
+            for row in violations_raw
+            if isinstance(row, dict)
+        ]
+
+        logger.info(
+            f"kdbx_q_lint: completed in {elapsed:.3f}s"
+            f" | mode={mode!r} | violations={len(violations)}"
+        )
+        return {
+            "status": "ok",
+            "clean": len(violations) == 0,
+            "violation_count": len(violations),
+            "violations": violations,
+        }
+
+    except RuntimeError as e:
+        return {"status": "error", "message": str(e)}
+    except Exception as e:
+        elapsed = time.perf_counter() - t0
+        logger.error(f"kdbx_q_lint: exception after {elapsed:.3f}s | error={e!r}")
+        return {"status": "error", "message": str(e)}
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -674,4 +761,59 @@ def register_tools(mcp_server):
             timeout=timeout,
         )
 
-    return ['kdbx_q_eval', 'kdbx_q_unit_test']
+    @mcp_server.tool()
+    async def kdbx_q_lint(
+        mode: str,
+        code_or_path: str,
+        timeout: int = 30,
+    ) -> Dict[str, Any]:
+        """
+        Lint q/kdb+ code using the KX Developer static linter (qlint.q_).
+
+        Use this as the FIRST gate before kdbx_q_eval or kdbx_q_unit_test.
+        It runs purely static analysis — no code is executed.
+
+        Modes
+        -----
+        item   Lint an inline q code string.
+               code_or_path = "myFunc:{[x;y] y*2}"
+
+        file   Lint a single .q or .quke file.
+               code_or_path = "/q-modules/finstat/finstat.q"
+               Paths under q-modules/ are mounted and accessible.
+
+        folder Recursively lint all .q files in a directory.
+               code_or_path = "/q-modules/finstat"
+
+        Output
+        ------
+        Returns a dict with:
+          status          – "ok" or "error"
+          clean           – true when no violations found
+          violation_count – total number of violations
+          violations      – list of violation objects, each with:
+                            label, errorClass, description, problemText,
+                            errorMessage, startLine, startCol, endLine, endCol
+
+        Common errorClass values
+        ------------------------
+          UNUSED_PARAM       – function parameter declared but never referenced
+          UNDECLARED_VAR     – variable used without prior assignment
+          ASSIGN_RESERVED_WORD – assignment to a built-in q name
+          FIXED_SEED         – use of a hard-coded random seed
+
+        Args:
+            mode         (str): "item", "file", or "folder"
+            code_or_path (str): Inline q code (item) or filesystem path (file/folder)
+            timeout      (int): Seconds before giving up (default 30)
+
+        Returns:
+            Dict with keys: status, clean, violation_count, violations
+        """
+        return await q_lint_impl(
+            mode=mode,
+            code_or_path=code_or_path,
+            timeout=timeout,
+        )
+
+    return ['kdbx_q_eval', 'kdbx_q_unit_test', 'kdbx_q_lint']

@@ -98,3 +98,124 @@ class TestEnsureQlintLoaded:
             from mcp_server.tools.kdbx_q_analytics import _ensure_qlint_loaded
             with pytest.raises(RuntimeError, match="qlint.q_ not found"):
                 _ensure_qlint_loaded(conn)
+
+
+# ---------------------------------------------------------------------------
+# q_lint_impl
+# ---------------------------------------------------------------------------
+
+def _mock_lint_conn(violations=None):
+    """Conn mock that returns JSON-encoded violation list."""
+    violations = violations or []
+    raw = MagicMock()
+    raw.py.return_value = json.dumps(violations).encode()
+    conn = MagicMock(return_value=raw)
+    return conn
+
+
+SAMPLE_VIOLATION = {
+    "label": "myFunc",
+    "errorClass": "UNUSED_PARAM",
+    "description": "Parameter x is never used",
+    "problemText": "myFunc:{[x;y] y*2}",
+    "errorMessage": "x declared but not referenced",
+    "startLine": 3,
+    "startCol": 0,
+    "endLine": 3,
+    "endCol": 18,
+}
+
+
+class TestQLintImpl:
+
+    @pytest.fixture(autouse=True)
+    def _patch_ensure(self):
+        with patch("mcp_server.tools.kdbx_q_analytics._ensure_qlint_loaded"):
+            yield
+
+    async def test_item_clean_returns_clean_true(self):
+        from mcp_server.tools.kdbx_q_analytics import q_lint_impl
+        conn = _mock_lint_conn(violations=[])
+        with patch("mcp_server.tools.kdbx_q_analytics.get_kdb_connection", return_value=conn):
+            result = await q_lint_impl("item", "1+1")
+        assert result["status"] == "ok"
+        assert result["clean"] is True
+        assert result["violation_count"] == 0
+        assert result["violations"] == []
+
+    async def test_item_with_violation_returns_clean_false(self):
+        from mcp_server.tools.kdbx_q_analytics import q_lint_impl
+        conn = _mock_lint_conn(violations=[SAMPLE_VIOLATION])
+        with patch("mcp_server.tools.kdbx_q_analytics.get_kdb_connection", return_value=conn):
+            result = await q_lint_impl("item", "myFunc:{[x;y] y*2}")
+        assert result["status"] == "ok"
+        assert result["clean"] is False
+        assert result["violation_count"] == 1
+        v = result["violations"][0]
+        assert v["errorClass"] == "UNUSED_PARAM"
+        assert v["label"] == "myFunc"
+        assert v["startLine"] == 3
+        assert v["endCol"] == 18
+
+    async def test_item_preserves_all_nine_fields(self):
+        from mcp_server.tools.kdbx_q_analytics import q_lint_impl
+        conn = _mock_lint_conn(violations=[SAMPLE_VIOLATION])
+        with patch("mcp_server.tools.kdbx_q_analytics.get_kdb_connection", return_value=conn):
+            result = await q_lint_impl("item", "myFunc:{[x;y] y*2}")
+        v = result["violations"][0]
+        for field in ("label", "errorClass", "description", "problemText",
+                      "errorMessage", "startLine", "startCol", "endLine", "endCol"):
+            assert field in v, f"Missing field: {field}"
+
+    async def test_file_mode_dispatches_lintFile(self):
+        from mcp_server.tools.kdbx_q_analytics import q_lint_impl
+        conn = _mock_lint_conn(violations=[])
+        with patch("mcp_server.tools.kdbx_q_analytics.get_kdb_connection", return_value=conn):
+            result = await q_lint_impl("file", "/q-modules/finstat/finstat.q")
+        assert result["status"] == "ok"
+        call_expr = conn.call_args_list[0][0][0]
+        assert "lintFile" in call_expr
+
+    async def test_folder_mode_dispatches_lintFolder(self):
+        from mcp_server.tools.kdbx_q_analytics import q_lint_impl
+        conn = _mock_lint_conn(violations=[])
+        with patch("mcp_server.tools.kdbx_q_analytics.get_kdb_connection", return_value=conn):
+            result = await q_lint_impl("folder", "/q-modules/finstat")
+        assert result["status"] == "ok"
+        call_expr = conn.call_args_list[0][0][0]
+        assert "lintFolder" in call_expr
+
+    async def test_invalid_mode_returns_error(self):
+        from mcp_server.tools.kdbx_q_analytics import q_lint_impl
+        conn = _mock_lint_conn()
+        with patch("mcp_server.tools.kdbx_q_analytics.get_kdb_connection", return_value=conn):
+            result = await q_lint_impl("bad_mode", "1+1")
+        assert result["status"] == "error"
+        assert "mode" in result["message"].lower()
+
+    async def test_qlint_not_found_returns_error(self):
+        from mcp_server.tools.kdbx_q_analytics import q_lint_impl, _QLINT_NOT_FOUND_MSG
+        with patch("mcp_server.tools.kdbx_q_analytics._ensure_qlint_loaded",
+                   side_effect=RuntimeError(_QLINT_NOT_FOUND_MSG)):
+            conn = MagicMock()
+            with patch("mcp_server.tools.kdbx_q_analytics.get_kdb_connection", return_value=conn):
+                result = await q_lint_impl("item", "1+1")
+        assert result["status"] == "error"
+        assert "qlint.q_ not found" in result["message"]
+
+    async def test_pykx_exception_returns_error(self):
+        from mcp_server.tools.kdbx_q_analytics import q_lint_impl
+        conn = MagicMock(side_effect=Exception("q error: type"))
+        with patch("mcp_server.tools.kdbx_q_analytics.get_kdb_connection", return_value=conn):
+            result = await q_lint_impl("item", "1+1")
+        assert result["status"] == "error"
+        assert "type" in result["message"]
+
+    async def test_ensure_qlint_loaded_called_on_every_invocation(self):
+        from mcp_server.tools.kdbx_q_analytics import q_lint_impl
+        conn = _mock_lint_conn()
+        with patch("mcp_server.tools.kdbx_q_analytics.get_kdb_connection", return_value=conn):
+            with patch("mcp_server.tools.kdbx_q_analytics._ensure_qlint_loaded") as mock_ensure:
+                await q_lint_impl("item", "1+1")
+                await q_lint_impl("item", "1+2")
+        assert mock_ensure.call_count == 2
