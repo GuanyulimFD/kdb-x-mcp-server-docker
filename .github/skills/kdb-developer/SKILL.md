@@ -21,6 +21,7 @@ argument-hint: "Paste the BDD spec and/or describe the q module to implement"
 2. **Test before file** — every q expression must be verified via `kdbx_q_eval` before being written to a `.q` file; no exceptions
 3. **JIT learning at code.kx** — when uncertain about q syntax, operator precedence, or KDB-X v5 behaviour, consult `https://code.kx.com/kdb-x/learn/q4m/` before guessing
 4. **Isolated test session** — after the module is complete, start a **new conversation** to write qcumber tests; load only the BDD spec, not the module code, to ensure tests are specification-driven not implementation-driven
+5. **Lint before review** — after assembling the module file, run `kdbx_q_lint` (`mode="file"`) against it and fix every violation before handing off to code review or starting the quke session. A non-clean lint result blocks progression exactly as a failing test does.
 
 ---
 
@@ -68,6 +69,15 @@ Test against real partitioned data in the live HDB where applicable. Use the sma
 
 **Never transcribe code to a file until all three checks (1a, 1b, 1c) pass.**
 
+#### 1e. Lint the file after transcription
+After writing one or more functions to the `.q` file, run `kdbx_q_lint` to catch violations before they accumulate:
+
+```
+kdbx_q_lint mode="file" code_or_path="q-modules/<name>/<name>.q"
+```
+
+Expected: `clean: true`. If violations are returned, fix them in the `.q` file and re-run before continuing. Common violations at this stage: unused parameters, unused local variables, shadowed names.
+
 ---
 
 ### Phase 2 — Module Assembly
@@ -112,6 +122,14 @@ key `.<name>
 / 5. Verify error guard triggers on bad input
 @[.<name>.myFunction; <bad args>; {show "error caught: ", x; 1b}]
 ```
+
+**6. Final lint gate — must be clean before sign-off:**
+
+```
+kdbx_q_lint mode="file" code_or_path="q-modules/<name>/<name>.q"
+```
+
+Required result: `clean: true`, `violation_count: 0`. If any violations remain, fix them and re-run. Do not proceed to Phase 4 or open a code review with a non-clean lint result. This step reduces reviewer burden by eliminating style and correctness issues that the linter can catch automatically.
 
 ---
 

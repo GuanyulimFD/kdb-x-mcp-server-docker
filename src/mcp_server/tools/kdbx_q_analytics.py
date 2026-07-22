@@ -1,3 +1,4 @@
+import asyncio
 import glob
 import logging
 import json
@@ -117,6 +118,62 @@ def _find_qcumber() -> str:
             return candidate
 
     return ""
+
+
+_QLINT_NOT_FOUND_MSG = (
+    "qlint.q_ not found. It is bundled with KX Developer.\n"
+    "\n"
+    "  qlint.q_ lives inside analyst/ws/ within the KX Developer install\n"
+    "  (not in ax-libraries — install_ax_libraries.sh will NOT provide it).\n"
+    "\n"
+    "  Quickest fix — set the path explicitly:\n"
+    "    KDBX_DB_QLINT_PATH=/path/to/developer-<ver>-<os>/analyst/ws/qlint.q_\n"
+    "\n"
+    "  Download KX Developer from: https://code.kx.com/developer/getting-started/"
+)
+
+
+def _find_qlint() -> str:
+    """Locate qlint.q_ from settings, env vars, or the KX Developer install glob.
+
+    Search order:
+      1. Explicit KDBX_DB_QLINT_PATH setting / env var
+      2. ~/.kx/ax-libraries/ws/qlint.q_    (standard KX tooling home)
+      3. AXLIBRARIES_HOME/ws/qlint.q_      (explicit env override)
+      4. ~/developer-*/analyst/ws/qlint.q_ (KX Developer install glob)
+    """
+    # 1. Explicit setting
+    configured = app_settings.db.qlint_path
+    if configured and os.path.isfile(configured):
+        return configured
+
+    # 2. Standard KX tooling home
+    kx_candidate = os.path.join(os.path.expanduser("~"), ".kx", "ax-libraries", "ws", "qlint.q_")
+    if os.path.isfile(kx_candidate):
+        return kx_candidate
+
+    # 3. AXLIBRARIES_HOME
+    ax = os.environ.get("AXLIBRARIES_HOME", "")
+    if ax:
+        candidate = os.path.join(ax, "ws", "qlint.q_")
+        if os.path.isfile(candidate):
+            return candidate
+
+    # 4. KX Developer install — qlint.q_ lives in analyst/ws/ only
+    for pattern in [
+        os.path.expanduser("~/developer-*/analyst/ws/qlint.q_"),
+        os.path.expanduser("~/developer-*-osx/analyst/ws/qlint.q_"),
+        os.path.expanduser("~/developer-*-linux/analyst/ws/qlint.q_"),
+        os.path.expanduser("~/.kx/developer-*/analyst/ws/qlint.q_"),
+        "/opt/developer/analyst/ws/qlint.q_",
+        "/usr/local/developer/analyst/ws/qlint.q_",
+    ]:
+        matches = sorted(glob.glob(pattern), reverse=True)
+        if matches:
+            return matches[0]
+
+    return ""
+
 
 
 def _get_q_arch_prefix() -> list:
@@ -441,6 +498,183 @@ async def q_unit_test_impl(
 
 
 # ---------------------------------------------------------------------------
+# kdbx_q_lint  (qlint.q_-backed)
+# ---------------------------------------------------------------------------
+
+async def q_lint_impl(
+    mode: str,
+    code_or_path: str,
+    timeout: int = 30,
+) -> Dict[str, Any]:
+    """Lint q code or a file/folder via qlint.q_ run as an x86_64 subprocess.
+
+    qlint.q_ depends on native x86_64 .so files (q_pcre.so) in analyst/ws/lib/.
+    It must run in a separate q process (not loaded into the live IPC session)
+    so that _get_q_arch_prefix() can force Rosetta 2 on arm64 macOS.
+    """
+    _preview = code_or_path[:200] + ("..." if len(code_or_path) > 200 else "")
+    logger.info(f"kdbx_q_lint: mode={mode!r} | input={_preview!r} | timeout={timeout}s")
+    t0 = time.perf_counter()
+
+    if mode not in ("item", "file", "folder"):
+        return {
+            "status": "error",
+            "message": f"Invalid mode {mode!r}. Must be 'item', 'file', or 'folder'.",
+        }
+
+    q_bin = _find_q_binary()
+    if not q_bin:
+        logger.error("kdbx_q_lint: cannot locate q binary")
+        return {
+            "status": "error",
+            "message": "Cannot locate q binary. Set Q_BINARY or ensure ~/.kx/bin/q exists.",
+        }
+
+    qlint_path = _find_qlint()
+    if not qlint_path:
+        logger.error("kdbx_q_lint: qlint.q_ not found")
+        return {"status": "error", "message": _QLINT_NOT_FOUND_MSG}
+
+    analyst_ws = os.path.dirname(qlint_path)   # cwd — so \l qlint.q_ resolves relative deps
+    lib_dir = os.path.join(analyst_ws, "lib")   # analyst/ws/lib/ — q_pcre.so lives here
+
+    arch_prefix = _get_q_arch_prefix()
+
+    if platform.system() == "Darwin":
+        extra_lib_env = {
+            "DYLD_LIBRARY_PATH": os.pathsep.join(filter(None, [
+                lib_dir,
+                os.environ.get("DYLD_LIBRARY_PATH", ""),
+            ])),
+        }
+    else:
+        extra_lib_env = {
+            "LD_LIBRARY_PATH": os.pathsep.join(filter(None, [
+                lib_dir,
+                os.environ.get("LD_LIBRARY_PATH", ""),
+            ])),
+        }
+
+    env = {
+        **os.environ,
+        "QLIC": os.environ.get("QLIC", os.path.expanduser("~/.kx")),
+        **extra_lib_env,
+    }
+
+    tmpdir = tempfile.mkdtemp(prefix="kdbx_qlint_")
+    try:
+        input_file  = os.path.join(tmpdir, "lint_input.txt")
+        runner_file = os.path.join(tmpdir, "lint_runner.q")
+
+        with open(input_file, "w") as f:
+            f.write(code_or_path)
+
+        # Runner q script: cwd is analyst/ws/ so \l qlint.q_ resolves relative deps.
+        # Input is read from a temp file (no q-string escaping needed for user content).
+        if mode == "item":
+            read_inp = f'inp:"\\n" sv read0 hsym `$"{input_file}"'
+            lint_call = "res:.qlint.lintItem[inp; ::]"
+        elif mode == "file":
+            read_inp = f'inp:first read0 hsym `$"{input_file}"'
+            lint_call = "res:.qlint.lintFile[inp]"
+        else:
+            read_inp = f'inp:first read0 hsym `$"{input_file}"'
+            lint_call = "res:.qlint.lintFolder[inp]"
+
+        runner_q = (
+            "\\l qlint.q_\n"
+            f"{read_inp}\n"
+            f"{lint_call}\n"
+            "-1 .j.j res;\n"
+            "\\\\\n"
+        )
+        with open(runner_file, "w") as f:
+            f.write(runner_q)
+
+        cmd = arch_prefix + [q_bin, runner_file, "-q"]
+        logger.info(f"kdbx_q_lint: cmd={' '.join(cmd)!r} | cwd={analyst_ws!r}")
+
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+            cwd=analyst_ws,
+            stdin=subprocess.DEVNULL,
+        )
+        elapsed = time.perf_counter() - t0
+
+        logger.debug(
+            f"kdbx_q_lint: subprocess exited | returncode={proc.returncode}"
+            f" | elapsed={elapsed:.3f}s"
+        )
+        if proc.stderr.strip():
+            logger.debug(f"kdbx_q_lint: stderr={proc.stderr.strip()!r}")
+
+        if proc.returncode != 0:
+            logger.error(
+                f"kdbx_q_lint: q exited with code {proc.returncode}"
+                f" | stderr={proc.stderr.strip()!r}"
+            )
+            return {
+                "status": "error",
+                "message": proc.stderr.strip() or f"q exited with code {proc.returncode}",
+            }
+
+        stdout = proc.stdout.strip()
+        try:
+            violations_raw = json.loads(stdout) if stdout else []
+        except json.JSONDecodeError as exc:
+            logger.error(f"kdbx_q_lint: failed to parse stdout as JSON | stdout={stdout!r} | error={exc}")
+            return {"status": "error", "message": f"Failed to parse linter output: {exc}"}
+
+        if not isinstance(violations_raw, list):
+            violations_raw = []
+
+        def _s(v):
+            return v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else (v if v is not None else "")
+
+        violations = [
+            {
+                "label":        _s(row.get("label", "")),
+                "errorClass":   _s(row.get("errorClass", "")),
+                "description":  _s(row.get("description", "")),
+                "problemText":  _s(row.get("problemText", "")),
+                "errorMessage": _s(row.get("errorMessage", "")),
+                "startLine":    row.get("startLine", 0),
+                "startCol":     row.get("startCol", 0),
+                "endLine":      row.get("endLine", 0),
+                "endCol":       row.get("endCol", 0),
+            }
+            for row in violations_raw
+            if isinstance(row, dict)
+        ]
+
+        logger.info(
+            f"kdbx_q_lint: completed in {elapsed:.3f}s"
+            f" | mode={mode!r} | violations={len(violations)}"
+        )
+        return {
+            "status": "ok",
+            "clean": len(violations) == 0,
+            "violation_count": len(violations),
+            "violations": violations,
+        }
+
+    except subprocess.TimeoutExpired:
+        elapsed = time.perf_counter() - t0
+        logger.error(f"kdbx_q_lint: timed out after {elapsed:.3f}s (limit={timeout}s)")
+        return {"status": "error", "message": f"qlint timed out after {timeout}s"}
+    except Exception as e:
+        elapsed = time.perf_counter() - t0
+        logger.error(f"kdbx_q_lint: exception after {elapsed:.3f}s | error={e!r}")
+        return {"status": "error", "message": str(e)}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -585,4 +819,59 @@ def register_tools(mcp_server):
             timeout=timeout,
         )
 
-    return ['kdbx_q_eval', 'kdbx_q_unit_test']
+    @mcp_server.tool()
+    async def kdbx_q_lint(
+        mode: str,
+        code_or_path: str,
+        timeout: int = 30,
+    ) -> Dict[str, Any]:
+        """
+        Lint q/kdb+ code using the KX Developer static linter (qlint.q_).
+
+        Use this as the FIRST gate before kdbx_q_eval or kdbx_q_unit_test.
+        It runs purely static analysis — no code is executed.
+
+        Modes
+        -----
+        item   Lint an inline q code string.
+               code_or_path = "myFunc:{[x;y] y*2}"
+
+        file   Lint a single .q or .quke file.
+               code_or_path = "/q-modules/finstat/finstat.q"
+               Paths under q-modules/ are mounted and accessible.
+
+        folder Recursively lint all .q files in a directory.
+               code_or_path = "/q-modules/finstat"
+
+        Output
+        ------
+        Returns a dict with:
+          status          – "ok" or "error"
+          clean           – true when no violations found
+          violation_count – total number of violations
+          violations      – list of violation objects, each with:
+                            label, errorClass, description, problemText,
+                            errorMessage, startLine, startCol, endLine, endCol
+
+        Common errorClass values
+        ------------------------
+          UNUSED_PARAM       – function parameter declared but never referenced
+          UNDECLARED_VAR     – variable used without prior assignment
+          ASSIGN_RESERVED_WORD – assignment to a built-in q name
+          FIXED_SEED         – use of a hard-coded random seed
+
+        Args:
+            mode         (str): "item", "file", or "folder"
+            code_or_path (str): Inline q code (item) or filesystem path (file/folder)
+            timeout      (int): Seconds before giving up (default 30)
+
+        Returns:
+            Dict with keys: status, clean, violation_count, violations
+        """
+        return await q_lint_impl(
+            mode=mode,
+            code_or_path=code_or_path,
+            timeout=timeout,
+        )
+
+    return ['kdbx_q_eval', 'kdbx_q_unit_test', 'kdbx_q_lint']

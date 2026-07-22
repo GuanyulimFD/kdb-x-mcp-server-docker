@@ -16,6 +16,7 @@ Use this checklist for every new module before marking it ready for code review.
 - [ ] Edge case (empty input, single row, boundary values) tested via `kdbx_q_eval`
 - [ ] HDB integration tested against at least one real date partition
 - [ ] Code transcribed to `.q` file ONLY after all three checks pass
+- [ ] `kdbx_q_lint mode="file"` run after transcription — `clean: true` required before moving to next function
 
 ### Module Assembly
 - [ ] File header block present (Module, Namespace, Description, Version, Requires, Author)
@@ -32,6 +33,7 @@ Use this checklist for every new module before marking it ready for code review.
 - [ ] Each public function runs correctly with representative inputs
 - [ ] Error guard `require_` triggers on known bad input
 - [ ] Module auto-loaded at KDB-X restart (or tested with `kdbx_q_eval` `\l` command)
+- [ ] `kdbx_q_lint mode="file"` on assembled module returns `clean: true` — **blocks sign-off if violations remain**
 
 ### Test Suite (new session)
 - [ ] NEW conversation started — module source code not loaded into context
@@ -46,6 +48,43 @@ Use this checklist for every new module before marking it ready for code review.
 ### Sign-off
 - [ ] Any non-obvious KDB-X insights recorded in `.github/kdb-knowhow.md`
 - [ ] Module entry added to `q-modules/README.md` available modules table
+
+---
+
+## Linting with kdbx_q_lint
+
+Run `kdbx_q_lint` at two points: after each function is transcribed (item/file mode) and as a hard gate before sign-off (file mode on the full module).
+
+### Lint a single function body (during Phase 1)
+```
+kdbx_q_lint mode="item" code_or_path="<paste function body here>"
+```
+Useful when iterating on a tricky function — catches unused params and variable issues before writing to disk.
+
+### Lint the full module file (Phase 2 → Phase 3 gate)
+```
+kdbx_q_lint mode="file" code_or_path="q-modules/<name>/<name>.q"
+```
+Expected clean result:
+```json
+{ "status": "ok", "clean": true, "violation_count": 0, "violations": [] }
+```
+
+### Lint the entire module directory
+```
+kdbx_q_lint mode="folder" code_or_path="q-modules/<name>"
+```
+Useful when a module has multiple `.q` files and you want a single pass before opening a PR.
+
+### Common violations and fixes
+
+| Violation | Cause | Fix |
+|-----------|-------|-----|
+| `UNUSED_PARAM` | Parameter declared but never referenced in body | Remove it or use it; use `_` convention if intentionally ignored |
+| `UNUSED_VAR` | Local variable assigned but never used | Remove the assignment or use the value |
+| `SHADOW_GLOBAL` | Local name shadows a global | Rename the local |
+
+A `violation_count > 0` result is treated as a failing test — do not proceed to Phase 4 or code review.
 
 ---
 
